@@ -59,7 +59,9 @@ Release packages: packaging\package.ps1 (Windows), packaging/package.sh (Linux).
 "@ | Set-Content "$src\README.txt" -Encoding utf8
 $szip = "$dist\$name-source.zip"
 if (Test-Path $szip) { Remove-Item -Force $szip }
-Compress-Archive -Path $src -DestinationPath $szip
+# Windows' tar: standard "/" paths, so the source zip also unpacks properly on Linux.
+& "$env:SystemRoot\System32\tar.exe" -a -c -f $szip -C $dist "$name-source"
+if ($LASTEXITCODE) { throw "Source zip failed" }
 
 Write-Host "Made $zip"
 Write-Host "Made $szip"

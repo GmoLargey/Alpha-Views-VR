@@ -22,7 +22,7 @@ starts with SteamVR.
   so boxes have real depth. Box modes choose which faces show: the whole box; top and far wall;
   far wall and floor; or everything but the front and floor.
 - **Key colour or camera:** green, blue or pink for colour-key streamers, or the headset's own
-  camera where SteamVR has one.
+  camera where SteamVR has one (used automatically until you pick a colour).
 - **Edit in the headset:** SteamVR's laser pointer moves, resizes and shapes the windows, with the
   same handles as Alpha Views XR (move, resize, round corners, lock, snap upright / level, free
   shape points, draw). The game gets no controller input while you edit.

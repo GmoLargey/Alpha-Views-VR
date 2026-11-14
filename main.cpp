@@ -468,15 +468,21 @@ static XMVECTOR TargetPoint(const Window& w, GrabMode mode, int k) {
 
 // ================================================================ settings and window files
 static std::string SettingsPath() { return g_dir + "/settings.cfg"; }
+// g_keyChosen: the user picked the colour (Colour button / C). Until then a headset camera, when
+// there is one, is used (CheckCamera). Files from before this flag: anything but the default green
+// counts as picked.
+static bool g_keyChosen = false;
 static void LoadSettings() {
     if (FILE* f = OpenFile(SettingsPath().c_str(), "r")) {
-        int k = 0, g = 1;
-        if (fscanf(f, "%d %d", &k, &g) >= 1) { g_keyMode = std::clamp(k, 0, 3); g_guideOn = g != 0; }
+        int k = 0, g = 1, c = -1;
+        int n = fscanf(f, "%d %d %d", &k, &g, &c);
+        if (n >= 1) { g_keyMode = std::clamp(k, 0, 3); g_keyChosen = n >= 3 ? c != 0 : k != 0; }
+        if (n >= 2) g_guideOn = g != 0;
         fclose(f);
     }
 }
 static void SaveSettings() {
-    if (FILE* f = OpenFile(SettingsPath().c_str(), "w")) { fprintf(f, "%d %d\n", g_keyMode, g_guideOn ? 1 : 0); fclose(f); }
+    if (FILE* f = OpenFile(SettingsPath().c_str(), "w")) { fprintf(f, "%d %d %d\n", g_keyMode, g_guideOn ? 1 : 0, g_keyChosen ? 1 : 0); fclose(f); }
 }
 static std::string ConfigPath() {
     std::string k;
@@ -652,6 +658,7 @@ static void SnapWindow(int wi) {
 }
 static void CycleKeyMode() {
     do g_keyMode = (g_keyMode + 1) % 4; while (g_keyMode == 3 && !g_hasCamera);
+    g_keyChosen = true;
     Log("Window colour: %s\n", kKeyName[g_keyMode]);
     SaveSettings();
 }
@@ -1110,6 +1117,11 @@ static void CheckCamera() {
     g_hasCamera = has;
     g_cameraStatus = has ? "available" : "none (headset or driver has no camera for SteamVR)";
     Log("Headset camera: %s\n", g_cameraStatus.c_str());
+    // No colour picked yet: start on the camera when the headset has one, else green.
+    if (!g_keyChosen) {
+        int want = has ? 3 : 0;
+        if (g_keyMode != want) { g_keyMode = want; Log("Window colour: %s (automatic)\n", kKeyName[g_keyMode]); }
+    }
 }
 static void StartCamera() {
     if (g_cam != INVALID_TRACKED_CAMERA_HANDLE || !g_hasCamera) return;

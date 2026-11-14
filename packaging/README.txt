@@ -31,9 +31,10 @@ You need:
   - One of these, for the windows to show your room:
       a) A streamer with colour-key passthrough, e.g. Virtual Desktop. Set its
          passthrough colour key to the same colour as Alpha Views VR (green by
-         default, see section 4).
+         default without a headset camera, see section 4).
       b) A headset with a camera that SteamVR can use (Valve Index, Reverb G2
-         with the Oasis driver, ...): choose "camera" as the colour.
+         with the Oasis driver, ...): Alpha Views VR starts on "camera" by
+         itself until you pick a colour.
 
 Alpha Views VR works with any SteamVR game, as it is drawn by SteamVR on top
 of the game. OpenXR games that run through SteamVR work too.
