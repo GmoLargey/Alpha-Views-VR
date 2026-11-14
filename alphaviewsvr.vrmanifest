@@ -1,0 +1,17 @@
+{
+  "source": "builtin",
+  "applications": [
+    {
+      "app_key": "gmo.alphaviewsvr",
+      "launch_type": "binary",
+      "binary_path_windows": "AlphaViewsVR.exe",
+      "is_dashboard_overlay": true,
+      "strings": {
+        "en_us": {
+          "name": "Alpha Views VR",
+          "description": "See-through windows over OpenVR games, for colour-key passthrough or the headset camera."
+        }
+      }
+    }
+  ]
+}
