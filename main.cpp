@@ -26,12 +26,20 @@
 //
 // Files: %LOCALAPPDATA%\AlphaViewsVR\ (log.txt, settings.cfg, windows_<game>.cfg and presets).
 
+#ifdef _WIN32
 #include <windows.h>
 #include <shlobj.h>
-#include <wincodec.h>
 #include <shellapi.h>
-#include <d3d11.h>
-#include <d3dcompiler.h>
+#else
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+// Vulkan on Windows and Linux alike, loaded at run time (no link-time dependency on the loader).
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>
 #include <DirectXMath.h>
 #include <openvr.h>
 
@@ -40,11 +48,24 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <cwchar>
+#include <iterator>
 #include <map>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
+
+// Text for the panels (stb_truetype) and the example pictures (stb_image_write): public domain / MIT.
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
+#ifdef _WIN32
+#define STBIW_WINDOWS_UTF8
+#endif
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 using namespace DirectX;
 using vr::HmdMatrix34_t;
@@ -62,31 +83,104 @@ static void Log(const char* fmt, ...) {
     va_list a; va_start(a, fmt); vfprintf(g_log, fmt, a); va_end(a);
     fflush(g_log);
 }
-static void InitDirAndLog() {
-    PWSTR p = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &p))) {
-        char buf[MAX_PATH * 3];
-        WideCharToMultiByte(CP_UTF8, 0, p, -1, buf, sizeof buf, nullptr, nullptr);
-        CoTaskMemFree(p);
-        g_dir = std::string(buf) + "\\AlphaViewsVR";
-        CreateDirectoryA(g_dir.c_str(), nullptr);
-        g_log = fopen((g_dir + "\\log.txt").c_str(), "w");
-    }
-}
-static double Now() {
-    static auto t0 = std::chrono::steady_clock::now();
-    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-}
-static std::wstring Widen(const std::string& s) {
+// ---------------------------------------------------------------- platform: the only parts that differ
+// Paths are UTF-8 with '/' (Windows takes those too).
+#ifdef _WIN32
+static std::wstring WideOf(const std::string& s) {
     if (s.empty()) return {};
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
     std::wstring w(n, 0);
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
 }
-static std::wstring Fmt(const wchar_t* f, ...) {
+static std::string Utf8Of(const wchar_t* w) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    std::string s(n > 0 ? n - 1 : 0, 0);
+    if (n > 1) WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
+    return s;
+}
+static FILE* OpenFile(const std::string& p, const char* mode) { return _wfopen(WideOf(p).c_str(), WideOf(mode).c_str()); }
+static bool FileExists(const std::string& p) { return GetFileAttributesW(WideOf(p).c_str()) != INVALID_FILE_ATTRIBUTES; }
+static std::string DataDir() {   // %LOCALAPPDATA%/AlphaViewsVR
+    PWSTR p = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &p))) return {};
+    std::string d = Utf8Of(p) + "/AlphaViewsVR";
+    CoTaskMemFree(p);
+    CreateDirectoryW(WideOf(d).c_str(), nullptr);
+    return d;
+}
+static std::string ExeDir() {
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::string s = Utf8Of(exe);
+    return s.substr(0, s.find_last_of("\\/"));
+}
+static bool SingleInstance() {   // held until the process ends
+    CreateMutexW(nullptr, TRUE, L"Local\\AlphaViewsVR");
+    return GetLastError() != ERROR_ALREADY_EXISTS;
+}
+static void Message(const char* text) { MessageBoxW(nullptr, WideOf(text).c_str(), L"Alpha Views VR", MB_OK | MB_ICONINFORMATION); }
+static int ProcessId() { return (int)GetCurrentProcessId(); }
+#else
+static FILE* OpenFile(const std::string& p, const char* mode) { return fopen(p.c_str(), mode); }
+static bool FileExists(const std::string& p) { struct stat st; return stat(p.c_str(), &st) == 0; }
+static std::string DataDir() {   // $XDG_DATA_HOME/AlphaViewsVR, or ~/.local/share/AlphaViewsVR
+    std::string base;
+    if (const char* x = getenv("XDG_DATA_HOME"); x && *x) base = x;
+    else if (const char* h = getenv("HOME"); h && *h) { base = std::string(h) + "/.local"; mkdir(base.c_str(), 0755); base += "/share"; }
+    else return {};
+    mkdir(base.c_str(), 0755);
+    std::string d = base + "/AlphaViewsVR";
+    mkdir(d.c_str(), 0755);
+    return d;
+}
+static std::string ExeDir() {
+    char exe[4096]; ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) return ".";
+    std::string s(exe, (size_t)n);
+    return s.substr(0, s.find_last_of('/'));
+}
+static bool SingleInstance() {   // a lock on a file in the data folder, held until the process ends
+    const char* rt = getenv("XDG_RUNTIME_DIR");
+    std::string p = (rt && *rt ? std::string(rt) : std::string("/tmp")) + "/alphaviewsvr-" + std::to_string(getuid()) + ".lock";
+    int fd = open(p.c_str(), O_RDWR | O_CREAT, 0600);
+    return fd < 0 || flock(fd, LOCK_EX | LOCK_NB) == 0;
+}
+static void Message(const char* text) {
+    fprintf(stderr, "Alpha Views VR: %s\n", text);
+    // A desktop message if a dialog tool is there (zenity on GNOME / SteamOS, kdialog on KDE).
+    std::string t = text;
+    for (size_t i = 0; (i = t.find('\'', i)) != std::string::npos; i += 4) t.replace(i, 1, "'\\''");
+    std::string cmd = "(zenity --info --title='Alpha Views VR' --text='" + t + "' || kdialog --title 'Alpha Views VR' --msgbox '" + t + "') >/dev/null 2>&1";
+    if (system(cmd.c_str())) {}
+}
+static int ProcessId() { return (int)getpid(); }
+#endif
+
+static void InitDirAndLog() {
+    g_dir = DataDir();
+    if (!g_dir.empty()) g_log = OpenFile(g_dir + "/log.txt", "w");
+}
+static double Now() {
+    static auto t0 = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+// Panel text is wide (UTF-16 on Windows, UTF-32 on Linux); only the BMP is used.
+static std::wstring Widen(const std::string& s) {
+    std::wstring w;
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = (unsigned char)s[i];
+        int n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 1;
+        uint32_t cp = n == 1 ? c : n == 2 ? (c & 31u) : n == 3 ? (c & 15u) : (c & 7u);
+        for (int k = 1; k < n; ++k) cp = (cp << 6) | ((i + k < s.size() ? (unsigned char)s[i + k] : 0x80) & 63u);
+        i += n;
+        w.push_back(cp > 0xFFFF ? L'?' : (wchar_t)cp);
+    }
+    return w;
+}
+static std::wstring Fmt(const wchar_t* f, ...) {   // wide strings as %ls
     wchar_t buf[512];
-    va_list a; va_start(a, f); _vsnwprintf_s(buf, _TRUNCATE, f, a); va_end(a);
+    va_list a; va_start(a, f); int n = vswprintf(buf, 512, f, a); va_end(a);
+    if (n < 0) buf[511] = 0;
     return buf;
 }
 
@@ -373,27 +467,27 @@ static XMVECTOR TargetPoint(const Window& w, GrabMode mode, int k) {
 }
 
 // ================================================================ settings and window files
-static std::string SettingsPath() { return g_dir + "\\settings.cfg"; }
+static std::string SettingsPath() { return g_dir + "/settings.cfg"; }
 static void LoadSettings() {
-    if (FILE* f = fopen(SettingsPath().c_str(), "r")) {
+    if (FILE* f = OpenFile(SettingsPath().c_str(), "r")) {
         int k = 0, g = 1;
         if (fscanf(f, "%d %d", &k, &g) >= 1) { g_keyMode = std::clamp(k, 0, 3); g_guideOn = g != 0; }
         fclose(f);
     }
 }
 static void SaveSettings() {
-    if (FILE* f = fopen(SettingsPath().c_str(), "w")) { fprintf(f, "%d %d\n", g_keyMode, g_guideOn ? 1 : 0); fclose(f); }
+    if (FILE* f = OpenFile(SettingsPath().c_str(), "w")) { fprintf(f, "%d %d\n", g_keyMode, g_guideOn ? 1 : 0); fclose(f); }
 }
 static std::string ConfigPath() {
     std::string k;
     for (char c : g_gameKey) k += (isalnum((unsigned char)c) || c == '.' || c == '-') ? c : '_';
-    return g_dir + "\\windows_" + k + ".cfg";
+    return g_dir + "/windows_" + k + ".cfg";
 }
 static std::string PresetPath(int i) { std::string p = ConfigPath(); return p.substr(0, p.size() - 4) + "_preset" + std::to_string(i + 1) + ".cfg"; }
 
 // Same format as Alpha Views XR (so the files read the same way).
 static bool ReadWindows(const std::string& path, bool* enabled) {
-    FILE* f = fopen(path.c_str(), "r");
+    FILE* f = OpenFile(path.c_str(), "r");
     if (!f) return false;
     std::vector<Window> ws;
     int count = 0, en = 1;
@@ -431,7 +525,7 @@ static bool ReadWindows(const std::string& path, bool* enabled) {
     return true;
 }
 static bool WriteWindows(const std::string& path) {
-    FILE* f = fopen(path.c_str(), "w");
+    FILE* f = OpenFile(path.c_str(), "w");
     if (!f) return false;
     fprintf(f, "%d %d\n", (int)g_windows.size(), g_windowsOn ? 1 : 0);
     for (auto& w : g_windows) {
@@ -444,7 +538,7 @@ static bool WriteWindows(const std::string& path) {
     fclose(f);
     return true;
 }
-static void CheckPresets() { for (int i = 0; i < 3; ++i) g_presetHas[i] = GetFileAttributesA(PresetPath(i).c_str()) != INVALID_FILE_ATTRIBUTES; }
+static void CheckPresets() { for (int i = 0; i < 3; ++i) g_presetHas[i] = FileExists(PresetPath(i)); }
 static void SaveWindows() { if (WriteWindows(ConfigPath())) Log("Saved %d window(s) for %s\n", (int)g_windows.size(), g_gameKey.c_str()); }
 static void LoadWindows() {
     g_windows.clear(); g_selected = -1; g_drawArmed = -1; g_windowsOn = true;
@@ -670,122 +764,315 @@ static void PaintIcon(uint32_t* px, int W, int H, int cx, int cy, float rad, con
         }
 }
 
-// ================================================================ D3D11
-static ID3D11Device* g_dev = nullptr;
-static ID3D11DeviceContext* g_ctx = nullptr;
-static ID3D11VertexShader* g_vs = nullptr;
-static ID3D11PixelShader* g_ps = nullptr;
-static ID3D11InputLayout* g_il = nullptr;
-static ID3D11Buffer* g_cb = nullptr;
-static ID3D11Buffer* g_vb = nullptr;
-static const UINT kVbFloats = 2 * 6 * 2048;
-static ID3D11SamplerState* g_samp = nullptr;
-static ID3D11RasterizerState* g_rs = nullptr;
+// ================================================================ Vulkan: the pictures handed to SteamVR
+// Every picture is drawn on the CPU and uploaded into a Vulkan image (B8G8R8A8), on Windows and Linux
+// alike. The Vulkan loader is opened at run time.
+#define AVVR_VK_INSTANCE_FUNCS(X) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) \
+    X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceMemoryProperties) X(vkEnumerateDeviceExtensionProperties) \
+    X(vkCreateDevice) X(vkGetDeviceProcAddr)
+#define AVVR_VK_DEVICE_FUNCS(X) X(vkGetDeviceQueue) X(vkCreateCommandPool) X(vkAllocateCommandBuffers) X(vkCreateFence) \
+    X(vkWaitForFences) X(vkResetFences) X(vkCreateImage) X(vkGetImageMemoryRequirements) X(vkAllocateMemory) X(vkBindImageMemory) \
+    X(vkCreateBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkMapMemory) X(vkBeginCommandBuffer) \
+    X(vkEndCommandBuffer) X(vkResetCommandBuffer) X(vkCmdPipelineBarrier) X(vkCmdCopyBufferToImage) X(vkQueueSubmit)
+#define AVVR_VK_DECLARE(f) static PFN_##f f = nullptr;
+static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
+static PFN_vkCreateInstance vkCreateInstance = nullptr;
+static PFN_vkEnumerateInstanceExtensionProperties vkEnumerateInstanceExtensionProperties = nullptr;
+static PFN_vkEnumerateInstanceVersion vkEnumerateInstanceVersion = nullptr;
+AVVR_VK_INSTANCE_FUNCS(AVVR_VK_DECLARE)
+AVVR_VK_DEVICE_FUNCS(AVVR_VK_DECLARE)
 
-static const char* kShader = R"(
-cbuffer C : register(b0) {
-    float4 col;              // colour (key colour, outline)
-    float4 halfMode;         // window half width, half height, mode (0 colour, 1 camera), 0
-    row_major float4x4 toCam; // window local -> camera clip
-    float4 camRect;          // camera picture in the camera texture: u0, v0, du, dv
-};
-Texture2D camTex : register(t0);
-SamplerState samp : register(s0);
-struct VO { float4 pos : SV_Position; float2 loc : LOC; };
-VO vs(float2 p : POS) { VO o; o.pos = float4(p, 0, 1); o.loc = p * halfMode.xy; return o; }
-float4 ps(VO i) : SV_Target {
-    if (halfMode.z < 0.5) return col;
-    float4 c = mul(float4(i.loc, 0, 1), toCam);
-    if (c.w <= 1e-4) return float4(0, 0, 0, 1);
-    float2 ndc = c.xy / c.w;
-    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    if (any(uv < 0) || any(uv > 1)) return float4(0, 0, 0, 1);
-    return float4(camTex.SampleLevel(samp, camRect.xy + uv * camRect.zw, 0).rgb, 1);
-}
-)";
-struct CB { XMFLOAT4 col, halfMode; XMFLOAT4X4 toCam; XMFLOAT4 camRect; };
+static VkInstance g_vkInst = VK_NULL_HANDLE;
+static VkPhysicalDevice g_vkPhys = VK_NULL_HANDLE;
+static VkDevice g_vkDev = VK_NULL_HANDLE;
+static VkQueue g_vkQueue = VK_NULL_HANDLE;
+static uint32_t g_vkFamily = 0;
+static VkCommandBuffer g_vkCmd = VK_NULL_HANDLE;
+static VkFence g_vkFence = VK_NULL_HANDLE;
+static VkPhysicalDeviceMemoryProperties g_vkMem{};
+static const VkFormat kTexFormat = VK_FORMAT_B8G8R8A8_UNORM;
 
-static bool InitD3D() {
-    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
-    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, &fl, 1,
-                                 D3D11_SDK_VERSION, &g_dev, nullptr, &g_ctx))) { Log("D3D11CreateDevice failed\n"); return false; }
-    ID3DBlob *vsb = nullptr, *psb = nullptr, *err = nullptr;
-    if (FAILED(D3DCompile(kShader, strlen(kShader), "avvr", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vsb, &err)) ||
-        FAILED(D3DCompile(kShader, strlen(kShader), "avvr", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &psb, &err))) {
-        Log("Shader compile failed: %s\n", err ? (const char*)err->GetBufferPointer() : "?");
-        return false;
+static std::vector<std::string> Words(const char* s) {
+    std::vector<std::string> out; std::string cur;
+    for (const char* p = s; ; ++p) {
+        if (!*p || *p == ' ') { if (!cur.empty()) out.push_back(cur); cur.clear(); if (!*p) break; }
+        else cur += *p;
     }
-    g_dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &g_vs);
-    g_dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &g_ps);
-    D3D11_INPUT_ELEMENT_DESC ie{ "POS", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 };
-    g_dev->CreateInputLayout(&ie, 1, vsb->GetBufferPointer(), vsb->GetBufferSize(), &g_il);
-    vsb->Release(); psb->Release();
-    D3D11_BUFFER_DESC bd{ sizeof(CB), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER };
-    g_dev->CreateBuffer(&bd, nullptr, &g_cb);
-    D3D11_BUFFER_DESC vd{ kVbFloats * 4, D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE };
-    g_dev->CreateBuffer(&vd, nullptr, &g_vb);
-    D3D11_SAMPLER_DESC sd{}; sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    g_dev->CreateSamplerState(&sd, &g_samp);
-    D3D11_RASTERIZER_DESC rd{}; rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.MultisampleEnable = TRUE;
-    g_dev->CreateRasterizerState(&rd, &g_rs);
-    return g_vs && g_ps && g_il && g_cb && g_vb && g_samp && g_rs;
+    return out;
 }
-static ID3D11Texture2D* MakeTexture(int w, int h, DXGI_FORMAT f, const void* px, bool rt, int samples = 1) {
-    D3D11_TEXTURE2D_DESC td{};
-    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1; td.Format = f;
-    td.SampleDesc.Count = samples; td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | (rt ? D3D11_BIND_RENDER_TARGET : 0);
-    D3D11_SUBRESOURCE_DATA sd{ px, (UINT)w * 4, 0 };
-    ID3D11Texture2D* t = nullptr;
-    g_dev->CreateTexture2D(&td, px ? &sd : nullptr, &t);
+static bool HasExt(const std::vector<VkExtensionProperties>& v, const std::string& e) {
+    for (auto& p : v) if (e == p.extensionName) return true;
+    return false;
+}
+static bool InitVulkan() {
+#ifdef _WIN32
+    if (HMODULE lib = LoadLibraryW(L"vulkan-1.dll")) vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)(void*)GetProcAddress(lib, "vkGetInstanceProcAddr");
+#else
+    void* lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+    if (lib) vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
+#endif
+    if (!vkGetInstanceProcAddr) { Log("Vulkan: no Vulkan loader found (vulkan-1.dll / libvulkan.so.1)\n"); return false; }
+    vkCreateInstance = (PFN_vkCreateInstance)vkGetInstanceProcAddr(nullptr, "vkCreateInstance");
+    vkEnumerateInstanceExtensionProperties = (PFN_vkEnumerateInstanceExtensionProperties)vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceExtensionProperties");
+    vkEnumerateInstanceVersion = (PFN_vkEnumerateInstanceVersion)vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceVersion");
+    if (!vkCreateInstance || !vkEnumerateInstanceExtensionProperties) { Log("Vulkan: loader incomplete\n"); return false; }
+
+    // The instance extensions SteamVR needs (those the loader has).
+    uint32_t n = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> have(n);
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, have.data());
+    char buf[4096] = "";
+    if (vr::VRCompositor()) vr::VRCompositor()->GetVulkanInstanceExtensionsRequired(buf, sizeof buf);
+    std::vector<std::string> want = Words(buf);
+    std::vector<const char*> ext;
+    for (auto& e : want) { if (HasExt(have, e)) ext.push_back(e.c_str()); else Log("Vulkan: instance extension %s isn't available\n", e.c_str()); }
+    uint32_t api = VK_API_VERSION_1_0;
+    if (vkEnumerateInstanceVersion) vkEnumerateInstanceVersion(&api);
+    VkApplicationInfo ai{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    ai.pApplicationName = "Alpha Views VR"; ai.pEngineName = "Alpha Views VR";
+    ai.apiVersion = api >= VK_API_VERSION_1_1 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0;
+    VkInstanceCreateInfo ic{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    ic.pApplicationInfo = &ai; ic.enabledExtensionCount = (uint32_t)ext.size(); ic.ppEnabledExtensionNames = ext.data();
+    VkResult r = vkCreateInstance(&ic, nullptr, &g_vkInst);
+    if (r != VK_SUCCESS) { Log("Vulkan: vkCreateInstance failed (%d)\n", (int)r); return false; }
+#define AVVR_VK_LOAD_I(f) f = (PFN_##f)vkGetInstanceProcAddr(g_vkInst, #f); if (!f) { Log("Vulkan: no %s\n", #f); return false; }
+    AVVR_VK_INSTANCE_FUNCS(AVVR_VK_LOAD_I)
+
+    // The GPU the headset is on.
+    uint64_t out = 0;
+    vr::VRSystem()->GetOutputDevice(&out, vr::TextureType_Vulkan, g_vkInst);
+    g_vkPhys = (VkPhysicalDevice)(uintptr_t)out;
+    if (!g_vkPhys) {
+        uint32_t pn = 0; vkEnumeratePhysicalDevices(g_vkInst, &pn, nullptr);
+        std::vector<VkPhysicalDevice> pd(pn); vkEnumeratePhysicalDevices(g_vkInst, &pn, pd.data());
+        if (pd.empty()) { Log("Vulkan: no GPU\n"); return false; }
+        g_vkPhys = pd[0];
+        Log("Vulkan: SteamVR didn't name its GPU: using the first one\n");
+    }
+    VkPhysicalDeviceProperties pp{}; vkGetPhysicalDeviceProperties(g_vkPhys, &pp);
+    vkGetPhysicalDeviceMemoryProperties(g_vkPhys, &g_vkMem);
+    // A queue that can copy: graphics if there is one (SteamVR copies the pictures on it too).
+    uint32_t qn = 0; vkGetPhysicalDeviceQueueFamilyProperties(g_vkPhys, &qn, nullptr);
+    std::vector<VkQueueFamilyProperties> qf(qn); vkGetPhysicalDeviceQueueFamilyProperties(g_vkPhys, &qn, qf.data());
+    int fam = -1;
+    for (uint32_t i = 0; i < qn && fam < 0; ++i) if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) fam = (int)i;
+    for (uint32_t i = 0; i < qn && fam < 0; ++i) if (qf[i].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT)) fam = (int)i;
+    if (fam < 0) { Log("Vulkan: no usable queue\n"); return false; }
+    g_vkFamily = (uint32_t)fam;
+    // The device extensions SteamVR needs.
+    uint32_t dn = 0; vkEnumerateDeviceExtensionProperties(g_vkPhys, nullptr, &dn, nullptr);
+    std::vector<VkExtensionProperties> dhave(dn); vkEnumerateDeviceExtensionProperties(g_vkPhys, nullptr, &dn, dhave.data());
+    char dbuf[4096] = "";
+    if (vr::VRCompositor()) vr::VRCompositor()->GetVulkanDeviceExtensionsRequired(g_vkPhys, dbuf, sizeof dbuf);
+    std::vector<std::string> dwant = Words(dbuf);
+    std::vector<const char*> dext;
+    for (auto& e : dwant) { if (HasExt(dhave, e)) dext.push_back(e.c_str()); else Log("Vulkan: device extension %s isn't available\n", e.c_str()); }
+    float prio = 1;
+    VkDeviceQueueCreateInfo qc{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
+    qc.queueFamilyIndex = g_vkFamily; qc.queueCount = 1; qc.pQueuePriorities = &prio;
+    VkDeviceCreateInfo dc{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+    dc.queueCreateInfoCount = 1; dc.pQueueCreateInfos = &qc; dc.enabledExtensionCount = (uint32_t)dext.size(); dc.ppEnabledExtensionNames = dext.data();
+    r = vkCreateDevice(g_vkPhys, &dc, nullptr, &g_vkDev);
+    if (r != VK_SUCCESS) { Log("Vulkan: vkCreateDevice failed (%d)\n", (int)r); g_vkDev = VK_NULL_HANDLE; return false; }
+#define AVVR_VK_LOAD_D(f) f = (PFN_##f)vkGetDeviceProcAddr(g_vkDev, #f); if (!f) { Log("Vulkan: no %s\n", #f); g_vkDev = VK_NULL_HANDLE; return false; }
+    AVVR_VK_DEVICE_FUNCS(AVVR_VK_LOAD_D)
+    vkGetDeviceQueue(g_vkDev, g_vkFamily, 0, &g_vkQueue);
+    VkCommandPoolCreateInfo pc{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    pc.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pc.queueFamilyIndex = g_vkFamily;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkFenceCreateInfo fc{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if (vkCreateCommandPool(g_vkDev, &pc, nullptr, &pool) != VK_SUCCESS || vkCreateFence(g_vkDev, &fc, nullptr, &g_vkFence) != VK_SUCCESS) { Log("Vulkan: setup failed\n"); g_vkDev = VK_NULL_HANDLE; return false; }
+    VkCommandBufferAllocateInfo ca{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    ca.commandPool = pool; ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ca.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(g_vkDev, &ca, &g_vkCmd) != VK_SUCCESS) { Log("Vulkan: setup failed\n"); g_vkDev = VK_NULL_HANDLE; return false; }
+    Log("Vulkan: %s (Vulkan %u.%u), queue family %u, %d+%d extensions for SteamVR\n", pp.deviceName, VK_API_VERSION_MAJOR(ai.apiVersion),
+        VK_API_VERSION_MINOR(ai.apiVersion), g_vkFamily, (int)ext.size(), (int)dext.size());
+    return true;
+}
+static int MemType(uint32_t bits, VkMemoryPropertyFlags want) {
+    for (uint32_t i = 0; i < g_vkMem.memoryTypeCount; ++i)
+        if ((bits & (1u << i)) && (g_vkMem.memoryTypes[i].propertyFlags & want) == want) return (int)i;
+    return -1;
+}
+
+// A picture for SteamVR: a Vulkan image and its upload buffer (BGRA pixels, 0xAARRGGBB).
+struct Tex { VkImage img = VK_NULL_HANDLE; VkBuffer buf = VK_NULL_HANDLE; void* map = nullptr; int w = 0, h = 0; bool ready = false;
+             uint32_t version = 0; };   // version: counts uploads (SteamVR copies a picture when it is set)
+static Tex* NewTex(int w, int h) {
+    if (!g_vkDev) return nullptr;
+    std::unique_ptr<Tex> t(new Tex);
+    t->w = w; t->h = h;
+    VkImageCreateInfo ic{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ic.imageType = VK_IMAGE_TYPE_2D; ic.format = kTexFormat; ic.extent = { (uint32_t)w, (uint32_t)h, 1 };
+    ic.mipLevels = 1; ic.arrayLayers = 1; ic.samples = VK_SAMPLE_COUNT_1_BIT; ic.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ic.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ic.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(g_vkDev, &ic, nullptr, &t->img) != VK_SUCCESS) { Log("Vulkan: vkCreateImage %dx%d failed\n", w, h); return nullptr; }
+    VkMemoryRequirements mr{}; vkGetImageMemoryRequirements(g_vkDev, t->img, &mr);
+    int mt = MemType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mt < 0) mt = MemType(mr.memoryTypeBits, 0);
+    VkMemoryAllocateInfo ma{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    ma.allocationSize = mr.size; ma.memoryTypeIndex = (uint32_t)mt;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (mt < 0 || vkAllocateMemory(g_vkDev, &ma, nullptr, &mem) != VK_SUCCESS || vkBindImageMemory(g_vkDev, t->img, mem, 0) != VK_SUCCESS) { Log("Vulkan: image memory failed\n"); return nullptr; }
+    VkBufferCreateInfo bc{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bc.size = (VkDeviceSize)w * h * 4; bc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT; bc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(g_vkDev, &bc, nullptr, &t->buf) != VK_SUCCESS) { Log("Vulkan: vkCreateBuffer failed\n"); return nullptr; }
+    vkGetBufferMemoryRequirements(g_vkDev, t->buf, &mr);
+    mt = MemType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    ma.allocationSize = mr.size; ma.memoryTypeIndex = (uint32_t)mt;
+    VkDeviceMemory bmem = VK_NULL_HANDLE;
+    if (mt < 0 || vkAllocateMemory(g_vkDev, &ma, nullptr, &bmem) != VK_SUCCESS || vkBindBufferMemory(g_vkDev, t->buf, bmem, 0) != VK_SUCCESS ||
+        vkMapMemory(g_vkDev, bmem, 0, VK_WHOLE_SIZE, 0, &t->map) != VK_SUCCESS) { Log("Vulkan: upload buffer failed\n"); return nullptr; }
+    return t.release();
+}
+// Copies the pixels into the picture and waits for it. The image ends in TRANSFER_SRC_OPTIMAL, as
+// SteamVR wants (it copies it on the same queue when the picture is set).
+static void Upload(Tex* t, const uint32_t* px) {
+    if (!t) return;
+    size_t bytes = (size_t)t->w * t->h * 4;
+    if (px) memcpy(t->map, px, bytes); else memset(t->map, 0, bytes);
+    vkResetCommandBuffer(g_vkCmd, 0);
+    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(g_vkCmd, &bi);
+    VkImageMemoryBarrier b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = t->img; b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    b.oldLayout = t->ready ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcAccessMask = t->ready ? VK_ACCESS_TRANSFER_READ_BIT : 0; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(g_vkCmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    VkBufferImageCopy cp{};
+    cp.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    cp.imageExtent = { (uint32_t)t->w, (uint32_t)t->h, 1 };
+    vkCmdCopyBufferToImage(g_vkCmd, t->buf, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(g_vkCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    vkEndCommandBuffer(g_vkCmd);
+    VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1; si.pCommandBuffers = &g_vkCmd;
+    if (vkQueueSubmit(g_vkQueue, 1, &si, g_vkFence) != VK_SUCCESS) { static int n = 0; if (n++ < 5) Log("Vulkan: upload failed\n"); return; }
+    vkWaitForFences(g_vkDev, 1, &g_vkFence, VK_TRUE, 2000000000ull);
+    vkResetFences(g_vkDev, 1, &g_vkFence);
+    t->ready = true;
+    ++t->version;
+}
+static Tex* MakeTexture(int w, int h, const uint32_t* px) {
+    Tex* t = NewTex(w, h);
+    Upload(t, px);
     return t;
 }
 
-// A render target (4x MSAA, resolved into tex) for a window picture or the traced outline.
+// ================================================================ window pictures (drawn on the CPU)
+static uint32_t PackBgra(float r, float g, float b, float a) {
+    auto c = [](float v) { return (uint32_t)(std::clamp(v, 0.0f, 1.0f) * 255 + 0.5f); };
+    return (c(a) << 24) | (c(r) << 16) | (c(g) << 8) | c(b);
+}
+// What a draw fills with: a colour, or (mode 1) the camera picture seen through the window.
+struct CB {
+    XMFLOAT4 col;        // colour (key colour, outline)
+    XMFLOAT4 halfMode;   // window half width, half height, mode (0 colour, 1 camera), 0
+    XMFLOAT4X4 toCam;    // window local -> camera clip (row vectors)
+    XMFLOAT4 camRect;    // camera 0's picture in the camera frame: u0, v0, du, dv
+};
+// A picture with 4 samples per pixel (as 4x MSAA), averaged into its texture at the end.
 struct Canvas {
     int size = 0;
-    ID3D11Texture2D *tex = nullptr, *msaa = nullptr;
-    ID3D11RenderTargetView* rtv = nullptr;
+    std::vector<uint32_t> smp, px;
+    Tex* tex = nullptr;
     bool Init(int n) {
         size = n;
-        tex = MakeTexture(n, n, DXGI_FORMAT_R8G8B8A8_UNORM, nullptr, false);
-        msaa = MakeTexture(n, n, DXGI_FORMAT_R8G8B8A8_UNORM, nullptr, true, 4);
-        if (msaa) g_dev->CreateRenderTargetView(msaa, nullptr, &rtv);
-        return tex && msaa && rtv;
+        smp.assign((size_t)n * n * 4, 0);
+        px.assign((size_t)n * n, 0);
+        tex = MakeTexture(n, n, nullptr);
+        return tex != nullptr;
     }
-    void Begin(const float clear[4]) {
-        g_ctx->ClearRenderTargetView(rtv, clear);
-        g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
-        D3D11_VIEWPORT vp{ 0, 0, (float)size, (float)size, 0, 1 };
-        g_ctx->RSSetViewports(1, &vp);
-        g_ctx->RSSetState(g_rs);
-        g_ctx->IASetInputLayout(g_il);
-        g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        UINT stride = 8, off = 0;
-        g_ctx->IASetVertexBuffers(0, 1, &g_vb, &stride, &off);
-        g_ctx->VSSetShader(g_vs, nullptr, 0);
-        g_ctx->PSSetShader(g_ps, nullptr, 0);
-        g_ctx->VSSetConstantBuffers(0, 1, &g_cb);
-        g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
-        g_ctx->PSSetSamplers(0, 1, &g_samp);
-    }
-    void End() {
-        ID3D11RenderTargetView* none = nullptr;
-        g_ctx->OMSetRenderTargets(1, &none, nullptr);
-        g_ctx->ResolveSubresource(tex, 0, msaa, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
-    }
+    void Begin(const float clear[4]);
+    void End();
 };
+static Canvas* g_canvas = nullptr;   // the one being drawn
+void Canvas::Begin(const float c[4]) {
+    std::fill(smp.begin(), smp.end(), PackBgra(c[0], c[1], c[2], c[3]));
+    g_canvas = this;
+}
+void Canvas::End() {
+    const size_t n = (size_t)size * size;
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t* s = &smp[i * 4];
+        if (s[0] == s[1] && s[0] == s[2] && s[0] == s[3]) { px[i] = s[0]; continue; }
+        uint32_t out = 0;
+        for (int sh = 0; sh < 32; sh += 8)
+            out |= ((((s[0] >> sh) & 255) + ((s[1] >> sh) & 255) + ((s[2] >> sh) & 255) + ((s[3] >> sh) & 255) + 2) / 4) << sh;
+        px[i] = out;
+    }
+    Upload(tex, px.data());
+    g_canvas = nullptr;
+}
+
+// The latest camera frame (RGBA bytes), for camera mode.
+static std::vector<uint8_t> g_camPx;
+static uint32_t g_camW = 0, g_camH = 0, g_camBpp = 4;
+static uint32_t CameraColour(const CB& cb, float lx, float ly) {
+    const auto& m = cb.toCam.m;
+    float cx = lx * m[0][0] + ly * m[1][0] + m[3][0], cy = lx * m[0][1] + ly * m[1][1] + m[3][1], cw = lx * m[0][3] + ly * m[1][3] + m[3][3];
+    if (cw <= 1e-4f || g_camPx.empty()) return 0xFF000000u;
+    float u = cx / cw * 0.5f + 0.5f, v = 0.5f - cy / cw * 0.5f;
+    if (u < 0 || u > 1 || v < 0 || v > 1) return 0xFF000000u;
+    float fx = (cb.camRect.x + u * cb.camRect.z) * g_camW - 0.5f, fy = (cb.camRect.y + v * cb.camRect.w) * g_camH - 0.5f;
+    int x0 = std::clamp((int)floorf(fx), 0, (int)g_camW - 1), y0 = std::clamp((int)floorf(fy), 0, (int)g_camH - 1);
+    int x1 = std::min(x0 + 1, (int)g_camW - 1), y1 = std::min(y0 + 1, (int)g_camH - 1);
+    float ax = std::clamp(fx - x0, 0.0f, 1.0f), ay = std::clamp(fy - y0, 0.0f, 1.0f);
+    auto at = [](int x, int y, int k) { return (float)g_camPx[((size_t)y * g_camW + x) * g_camBpp + k]; };
+    float c[3];
+    for (int k = 0; k < 3; ++k) {
+        float top = at(x0, y0, k) + (at(x1, y0, k) - at(x0, y0, k)) * ax, bot = at(x0, y1, k) + (at(x1, y1, k) - at(x0, y1, k)) * ax;
+        c[k] = (top + (bot - top) * ay) / 255.0f;
+    }
+    return PackBgra(c[0], c[1], c[2], 1);
+}
+// Triangles (clip space, -1..1, y up) into the canvas being drawn.
 static void DrawTris(const std::vector<XMFLOAT2>& v, const CB& cb) {
-    if (v.empty()) return;
-    g_ctx->UpdateSubresource(g_cb, 0, nullptr, &cb, 0, 0);
-    for (size_t first = 0; first < v.size(); first += kVbFloats / 2 / 3 * 3) {
-        size_t n = std::min(v.size() - first, (size_t)(kVbFloats / 2 / 3 * 3));
-        D3D11_MAPPED_SUBRESOURCE m;
-        if (FAILED(g_ctx->Map(g_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
-        memcpy(m.pData, v.data() + first, n * sizeof(XMFLOAT2));
-        g_ctx->Unmap(g_vb, 0);
-        g_ctx->Draw((UINT)n, 0);
+    Canvas* cv = g_canvas;
+    if (!cv || v.size() < 3) return;
+    static const float kOff[4][2] = { { -2 / 16.0f, -6 / 16.0f }, { 6 / 16.0f, -2 / 16.0f }, { -6 / 16.0f, 2 / 16.0f }, { 2 / 16.0f, 6 / 16.0f } };   // D3D's 4x pattern
+    const int n = cv->size;
+    const bool cam = cb.halfMode.z >= 0.5f;
+    const uint32_t flat = PackBgra(cb.col.x, cb.col.y, cb.col.z, cb.col.w);
+    for (size_t t = 0; t + 2 < v.size(); t += 3) {
+        float x[3], y[3];
+        for (int k = 0; k < 3; ++k) { x[k] = (v[t + k].x * 0.5f + 0.5f) * n; y[k] = (0.5f - v[t + k].y * 0.5f) * n; }
+        float area = (x[1] - x[0]) * (y[2] - y[0]) - (y[1] - y[0]) * (x[2] - x[0]);
+        if (fabsf(area) < 1e-9f) continue;
+        float sg = area > 0 ? 1.0f : -1.0f;
+        int bx0 = std::max(0, (int)floorf(std::min({ x[0], x[1], x[2] }))), bx1 = std::min(n - 1, (int)ceilf(std::max({ x[0], x[1], x[2] })));
+        int by0 = std::max(0, (int)floorf(std::min({ y[0], y[1], y[2] }))), by1 = std::min(n - 1, (int)ceilf(std::max({ y[0], y[1], y[2] })));
+        if (bx0 > bx1 || by0 > by1) continue;
+        // Edge functions: e = A*sx + B*sy + C, inside when all are >= 0 (after the winding sign).
+        float A[3], B[3], C[3];
+        for (int k = 0; k < 3; ++k) {
+            int j = (k + 1) % 3;
+            A[k] = -(y[j] - y[k]) * sg; B[k] = (x[j] - x[k]) * sg; C[k] = -(A[k] * x[k] + B[k] * y[k]);
+        }
+        for (int py = by0; py <= by1; ++py)
+            for (int px = bx0; px <= bx1; ++px) {
+                unsigned mask = 0;
+                for (int s = 0; s < 4; ++s) {
+                    float sx = px + 0.5f + kOff[s][0], sy = py + 0.5f + kOff[s][1];
+                    if (A[0] * sx + B[0] * sy + C[0] >= 0 && A[1] * sx + B[1] * sy + C[1] >= 0 && A[2] * sx + B[2] * sy + C[2] >= 0) mask |= 1u << s;
+                }
+                if (!mask) continue;
+                uint32_t col = flat;
+                if (cam) {
+                    float nx = (px + 0.5f) / n * 2 - 1, ny = 1 - (py + 0.5f) / n * 2;
+                    col = CameraColour(cb, nx * cb.halfMode.x, ny * cb.halfMode.y);
+                }
+                uint32_t* d = &cv->smp[((size_t)py * n + px) * 4];
+                for (int s = 0; s < 4; ++s) if (mask & (1u << s)) d[s] = col;
+            }
     }
 }
 // A band along a closed (or open) outline, `wid` wide on its inside (points in metres, scaled by sx, sy
@@ -812,7 +1099,6 @@ static void Ribbon(const std::vector<XMFLOAT2>& p, bool closed, float wid, float
 
 // ================================================================ headset camera
 static vr::TrackedCameraHandle_t g_cam = INVALID_TRACKED_CAMERA_HANDLE;
-static ID3D11ShaderResourceView* g_camSrv = nullptr;
 static XMFLOAT4X4 g_camWorldToClip;   // world -> camera clip (row vectors), for the latest frame
 static XMFLOAT4 g_camRect{ 0, 0, 1, 1 };
 static uint32_t g_camSeq = 0;
@@ -840,35 +1126,39 @@ static void StopCamera() {
     vr::VRTrackedCamera()->ReleaseVideoStreamingService(g_cam);
     g_cam = INVALID_TRACKED_CAMERA_HANDLE;
     g_camFrameOk = false;
-    if (g_camSrv) { g_camSrv->Release(); g_camSrv = nullptr; }
+    g_camPx.clear();
     Log("Camera streaming stopped\n");
 }
-// Latest frame: its texture, where camera 0's picture is in it, and world -> camera clip.
+// Latest frame: its pixels, where camera 0's picture is in it, and world -> camera clip.
 static bool UpdateCamera() {
     if (g_cam == INVALID_TRACKED_CAMERA_HANDLE) return false;
     auto* tc = vr::VRTrackedCamera();
+    const vr::EVRTrackedCameraFrameType kType = vr::VRTrackedCameraFrameType_Undistorted;
+    uint32_t fw = 0, fh = 0, fbytes = 0;
+    vr::EVRTrackedCameraError e = tc->GetCameraFrameSize(vr::k_unTrackedDeviceIndex_Hmd, kType, &fw, &fh, &fbytes);
     vr::CameraVideoStreamFrameHeader_t hdr{};
-    ID3D11ShaderResourceView* srv = nullptr;
-    vr::EVRTrackedCameraError e = tc->GetVideoStreamTextureD3D11(g_cam, vr::VRTrackedCameraFrameType_MaximumUndistorted, g_dev, (void**)&srv, &hdr, sizeof hdr);
-    if (e != vr::VRTrackedCameraError_None || !srv) {
+    static std::vector<uint8_t> frame;
+    if (e == vr::VRTrackedCameraError_None && fw && fh && fbytes >= fw * fh * 3) {
+        frame.resize(fbytes);
+        e = tc->GetVideoStreamFrameBuffer(g_cam, kType, frame.data(), fbytes, &hdr, sizeof hdr);
+    } else if (e == vr::VRTrackedCameraError_None) e = vr::VRTrackedCameraError_NoFrameAvailable;
+    if (e != vr::VRTrackedCameraError_None) {
         static int lastE = -1;
         if ((int)e != lastE) { Log("Camera frame: %s\n", tc->GetCameraErrorNameFromEnum(e)); lastE = (int)e; }
         g_cameraStatus = e == vr::VRTrackedCameraError_NoFrameAvailable ? "waiting for pictures" : tc->GetCameraErrorNameFromEnum(e);
         return g_camFrameOk;
     }
-    if (g_camSrv && g_camSrv != srv) g_camSrv->Release();
-    g_camSrv = srv;
     if (hdr.nFrameSequence == g_camSeq && g_camFrameOk) return true;
     g_camSeq = hdr.nFrameSequence;
-    // Camera 0's picture (the left one on stereo cameras) inside the shared texture.
-    vr::VRTextureBounds_t b{ 0, 0, 1, 1 }; uint32_t tw = 0, th = 0;
-    tc->GetVideoStreamTextureSize(vr::k_unTrackedDeviceIndex_Hmd, vr::VRTrackedCameraFrameType_Undistorted, &b, &tw, &th);
+    g_camPx.swap(frame);
+    g_camW = fw; g_camH = fh; g_camBpp = fbytes / (fw * fh) >= 4 ? 4 : 3;
+    // Camera 0's picture (the left one on stereo cameras) inside the frame.
     int32_t layout = vr::VRSystem()->GetInt32TrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_CameraFrameLayout_Int32);
-    float u0 = b.uMin, v0 = b.vMin, du = b.uMax - b.uMin, dv = b.vMax - b.vMin;
+    float du = 1, dv = 1;
     if (layout & vr::EVRTrackedCameraFrameLayout_Stereo) {
-        if (layout & vr::EVRTrackedCameraFrameLayout_VerticalLayout) dv *= 0.5f; else du *= 0.5f;
+        if (layout & vr::EVRTrackedCameraFrameLayout_VerticalLayout) dv = 0.5f; else du = 0.5f;
     }
-    g_camRect = { u0, v0, du, dv };
+    g_camRect = { 0, 0, du, dv };
     // Camera pose: the headset at capture, times camera 0's place on the headset.
     HmdMatrix34_t camToHead[4]{};
     vr::ETrackedPropertyError pe = vr::TrackedProp_Success;
@@ -878,12 +1168,12 @@ static bool UpdateCamera() {
                  : FromHmd(vr::VRSystem()->GetMatrix34TrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_CameraToHeadTransform_Matrix34));
     XMMATRIX head = hdr.trackedDevicePose.bPoseIsValid ? FromHmd(hdr.trackedDevicePose.mDeviceToAbsoluteTracking) : g_headM;
     vr::HmdMatrix44_t pr{};
-    tc->GetCameraProjection(vr::k_unTrackedDeviceIndex_Hmd, 0, vr::VRTrackedCameraFrameType_Undistorted, 0.05f, 100.0f, &pr);
+    tc->GetCameraProjection(vr::k_unTrackedDeviceIndex_Hmd, 0, kType, 0.05f, 100.0f, &pr);
     XMFLOAT4X4 prt;   // OpenVR's column-vector projection -> row vectors
     for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) prt.m[j][i] = pr.m[i][j];
     XMMATRIX worldToCam = XMMatrixInverse(nullptr, c2h * head);
     XMStoreFloat4x4(&g_camWorldToClip, worldToCam * XMLoadFloat4x4(&prt));
-    if (!g_camFrameOk) Log("Camera pictures arriving: %ux%u, camera 0 in u %.3f..%.3f v %.3f..%.3f (layout 0x%x)\n", tw, th, u0, u0 + du, v0, v0 + dv, layout);
+    if (!g_camFrameOk) Log("Camera pictures arriving: %ux%u (%u bytes a pixel), camera 0 in u 0..%.2f v 0..%.2f (layout 0x%x)\n", fw, fh, g_camBpp, du, dv, layout);
     g_camFrameOk = true;
     g_cameraStatus = "showing";
     return true;
@@ -891,8 +1181,14 @@ static bool UpdateCamera() {
 
 // ================================================================ overlays
 static vr::IVROverlay* O() { return vr::VROverlay(); }
-static void SetTex(vr::VROverlayHandle_t ov, ID3D11Texture2D* t) {
-    vr::Texture_t tex{ (void*)t, vr::TextureType_DirectX, vr::ColorSpace_Auto };
+static void SetTex(vr::VROverlayHandle_t ov, Tex* t) {
+    if (!t || !t->ready) return;
+    vr::VRVulkanTextureData_t d{};
+    d.m_nImage = (uint64_t)(uintptr_t)t->img;
+    d.m_pDevice = g_vkDev; d.m_pPhysicalDevice = g_vkPhys; d.m_pInstance = g_vkInst; d.m_pQueue = g_vkQueue;
+    d.m_nQueueFamilyIndex = g_vkFamily; d.m_nWidth = (uint32_t)t->w; d.m_nHeight = (uint32_t)t->h;
+    d.m_nFormat = (uint32_t)kTexFormat; d.m_nSampleCount = 1;
+    vr::Texture_t tex{ &d, vr::TextureType_Vulkan, vr::ColorSpace_Auto };
     vr::EVROverlayError e = O()->SetOverlayTexture(ov, &tex);
     if (e != vr::VROverlayError_None) { static int n = 0; if (n++ < 10) Log("SetOverlayTexture: %s\n", O()->GetOverlayErrorNameFromEnum(e)); }
 }
@@ -916,16 +1212,16 @@ struct WinOv { vr::VROverlayHandle_t ov = vr::k_ulOverlayHandleInvalid; Canvas c
               XMFLOAT4X4 frame{}; float halfW = 0.1f, halfH = 0.1f; };   // where the picture is (a box: the sheet facing you)
 static std::vector<WinOv> g_winOv;
 // Handle overlays: a pool, given out each frame to the selected window's handles.
-struct HandleOv { vr::VROverlayHandle_t ov = vr::k_ulOverlayHandleInvalid; ID3D11Texture2D* tex = nullptr; bool shown = false, inter = false, flip = false;
+struct HandleOv { vr::VROverlayHandle_t ov = vr::k_ulOverlayHandleInvalid; Tex* tex = nullptr; bool shown = false, inter = false, flip = false;
                   GrabMode mode = GRAB_NONE; int win = -1, k = -1; };
 static std::vector<HandleOv> g_handleOv;
-static std::map<std::string, ID3D11Texture2D*> g_iconTex;
+static std::map<std::string, Tex*> g_iconTex;
 static vr::VROverlayHandle_t g_guideOv = vr::k_ulOverlayHandleInvalid, g_traceOv = vr::k_ulOverlayHandleInvalid;
 static vr::VROverlayHandle_t g_dashOv = vr::k_ulOverlayHandleInvalid, g_dashThumb = vr::k_ulOverlayHandleInvalid;
 static Canvas g_traceCv;
 static const float kTraceHalf = 1.25f;  // the drawing sheet: 2.5 m square on the window's plane
 
-static ID3D11Texture2D* IconTexture(const IconLook& ic) {
+static Tex* IconTexture(const IconLook& ic) {
     char key[160];
     snprintf(key, sizeof key, "%d %.3f %.3f %.3f %.3f %.3f %.3f %d", ic.id, ic.c[0], ic.c[1], ic.c[2], ic.g[0], ic.g[1], ic.g[2], ic.ownG);
     auto it = g_iconTex.find(key);
@@ -933,73 +1229,260 @@ static ID3D11Texture2D* IconTexture(const IconLook& ic) {
     const int n = 128;
     std::vector<uint32_t> px((size_t)n * n, 0);
     PaintIcon(px.data(), n, n, n / 2, n / 2, n * 0.45f, ic, true);
-    ID3D11Texture2D* t = MakeTexture(n, n, DXGI_FORMAT_B8G8R8A8_UNORM, px.data(), false);
+    Tex* t = MakeTexture(n, n, px.data());
     g_iconTex[key] = t;
     return t;
 }
 
-// ================================================================ guide panel and dashboard (GDI pictures)
-struct Gdi {
-    int W = 0, H = 0; HDC dc = nullptr; void* bits = nullptr;
-    HFONT fTitle, fHead, fBtn, fText, fSmall;
-    bool Init(int w, int h) {
-        W = w; H = h;
-        dc = CreateCompatibleDC(nullptr);
-        BITMAPINFO bi{}; bi.bmiHeader = { sizeof(BITMAPINFOHEADER), W, -H, 1, 32, BI_RGB };
-        HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-        if (!bmp || !bits) return false;
-        SelectObject(dc, bmp);
-        SetBkMode(dc, TRANSPARENT);
-        auto font = [](int px, int weight) { return CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                                                                CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI"); };
-        fTitle = font(44, FW_BOLD); fHead = font(32, FW_BOLD); fBtn = font(30, FW_SEMIBOLD); fText = font(27, FW_NORMAL); fSmall = font(23, FW_NORMAL);
+// ================================================================ guide panel and dashboard (text pictures)
+// Text by stb_truetype: Segoe UI on Windows, the desktop's sans-serif font on Linux.
+#ifndef RGB
+#define RGB(r, g, b) ((uint32_t)(((r) & 255) | (((g) & 255) << 8) | (((b) & 255) << 16)))
+#endif
+typedef uint32_t Colour;   // as RGB(): 0x00BBGGRR
+struct IRect { int left, top, right, bottom; };
+enum : unsigned { TX_LEFT = 0, TX_CENTER = 1, TX_RIGHT = 2, TX_VCENTER = 4, TX_SINGLELINE = 8, TX_WORDBREAK = 16, TX_END_ELLIPSIS = 32 };
+
+struct FontFile { std::vector<unsigned char> data; stbtt_fontinfo info{}; bool ok = false; std::string path; float fit = 1; };
+static bool LoadFontFile(FontFile& f, const std::string& path, int weight) {
+    if (path.empty()) return false;
+    FILE* fp = OpenFile(path, "rb");
+    if (!fp) return false;
+    fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
+    if (sz <= 0) { fclose(fp); return false; }
+    f.data.resize((size_t)sz);
+    size_t got = fread(f.data.data(), 1, (size_t)sz, fp);
+    fclose(fp);
+    int off = stbtt_GetFontOffsetForIndex(f.data.data(), 0);
+    if (got != (size_t)sz || off < 0 || !stbtt_InitFont(&f.info, f.data.data(), off)) { f.data.clear(); return false; }
+    f.ok = true; f.path = path;
+    // Other fonts than Segoe UI are often wider: scale them so the text takes about Segoe UI's width
+    // (the panels are laid out for it).
+    const char* abc = "abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    float em = stbtt_ScaleForMappingEmToPixels(&f.info, 1), w = 0;
+    for (const char* p = abc; *p; ++p) { int adv, lsb; stbtt_GetCodepointHMetrics(&f.info, *p, &adv, &lsb); w += adv * em; }
+    const float kSegoeWidth[3] = { 29.02f, 30.05f, 31.30f };   // Segoe UI regular, semibold, bold: the string above, 1 px em
+    f.fit = std::clamp(kSegoeWidth[weight] / std::max(1.0f, w), 0.8f, 1.0f);
+    return true;
+}
+static std::string FindFont(int weight) {   // 0 regular, 1 semibold, 2 bold
+#ifdef _WIN32
+    const char* wd = getenv("WINDIR");
+    std::string dir = std::string(wd && *wd ? wd : "C:\\Windows") + "/Fonts/";
+    static const char* kFiles[3][3] = { { "segoeui.ttf", "arial.ttf", "tahoma.ttf" }, { "seguisb.ttf", "segoeuib.ttf", "arialbd.ttf" }, { "segoeuib.ttf", "arialbd.ttf", "tahomabd.ttf" } };
+    for (const char* f : kFiles[weight]) if (FileExists(dir + f)) return dir + f;
+#else
+    // fontconfig's choice first, then the usual places.
+    static const char* kFc[3] = { "sans-serif", "sans-serif:semibold", "sans-serif:bold" };
+    std::string cmd = std::string("fc-match -f '%{file}' '") + kFc[weight] + "' 2>/dev/null";
+    if (FILE* p = popen(cmd.c_str(), "r")) {
+        char buf[1024] = ""; size_t n = fread(buf, 1, sizeof buf - 1, p); buf[n] = 0;
+        pclose(p);
+        std::string s = buf;
+        auto ends = [&](const char* e) { size_t l = strlen(e); return s.size() > l && strcasecmp(s.c_str() + s.size() - l, e) == 0; };
+        if ((ends(".ttf") || ends(".otf") || ends(".ttc")) && FileExists(s)) return s;
+    }
+    static const char* kDirs[] = { "/usr/share/fonts/truetype/dejavu/", "/usr/share/fonts/TTF/", "/usr/share/fonts/dejavu/", "/usr/share/fonts/dejavu-sans-fonts/",
+                                   "/usr/share/fonts/noto/", "/usr/share/fonts/truetype/noto/", "/usr/share/fonts/google-noto/",
+                                   "/usr/share/fonts/liberation/", "/usr/share/fonts/truetype/liberation/", "/usr/share/fonts/liberation-sans/" };
+    static const char* kFiles[3][5] = {
+        { "DejaVuSans.ttf", "NotoSans-Regular.ttf", "LiberationSans-Regular.ttf", "", "" },
+        { "NotoSans-SemiBold.ttf", "DejaVuSans-Bold.ttf", "NotoSans-Bold.ttf", "LiberationSans-Bold.ttf", "" },
+        { "DejaVuSans-Bold.ttf", "NotoSans-Bold.ttf", "LiberationSans-Bold.ttf", "", "" } };
+    for (const char* f : kFiles[weight])
+        for (const char* d : kDirs) if (*f && FileExists(std::string(d) + f)) return std::string(d) + f;
+#endif
+    return {};
+}
+static FontFile g_fontFile[3];
+static bool g_fontsTried = false;
+struct GlyphBmp { std::vector<uint8_t> a; int w = 0, h = 0, x0 = 0, y0 = 0; };
+struct Font {
+    FontFile* file = nullptr;
+    float scale = 0;
+    int ascent = 0, descent = 0, lineH = 0;   // lineH: as Segoe UI's (1.33 em), so the panels keep their spacing
+    std::map<uint32_t, GlyphBmp> cache;   // codepoint * 4 + quarter-pixel offset
+    bool Init(int weight, float px) {
+        if (!g_fontsTried) {
+            g_fontsTried = true;
+            for (int i = 0; i < 3; ++i) {
+                std::string p = FindFont(i);
+                if (LoadFontFile(g_fontFile[i], p, i)) Log("Font %d: %s\n", i, p.c_str());
+                else Log("Font %d: none found%s\n", i, p.empty() ? "" : (" (couldn't read " + p + ")").c_str());
+            }
+            for (int i = 0; i < 3; ++i) if (!g_fontFile[i].ok) for (int j : { 0, 2, 1 }) if (g_fontFile[j].ok) { g_fontFile[i] = g_fontFile[j]; stbtt_InitFont(&g_fontFile[i].info, g_fontFile[i].data.data(), stbtt_GetFontOffsetForIndex(g_fontFile[i].data.data(), 0)); break; }
+        }
+        file = &g_fontFile[weight];
+        if (!file->ok) return false;
+        scale = stbtt_ScaleForMappingEmToPixels(&file->info, px * file->fit);   // as GDI's CreateFont(-px)
+        int a, d, g; stbtt_GetFontVMetrics(&file->info, &a, &d, &g);
+        ascent = (int)ceilf(a * scale); descent = (int)floorf(d * scale);
+        lineH = std::max(ascent - descent, (int)lroundf(px * 1.33f));
         return true;
     }
-    void Fill(RECT r, COLORREF c) { HBRUSH b = CreateSolidBrush(c); FillRect(dc, &r, b); DeleteObject(b); }
-    void Round(RECT r, int rad, COLORREF c) {
-        HBRUSH b = CreateSolidBrush(c); HPEN p = CreatePen(PS_SOLID, 1, c);
-        HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
-        RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
-        SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b); DeleteObject(p);
+    float Advance(uint32_t cp) const { int adv, lsb; stbtt_GetCodepointHMetrics(&file->info, (int)cp, &adv, &lsb); return adv * scale; }
+    float Kern(uint32_t a, uint32_t b) const { return stbtt_GetCodepointKernAdvance(&file->info, (int)a, (int)b) * scale; }
+    bool Has(uint32_t cp) const { return stbtt_FindGlyphIndex(&file->info, (int)cp) != 0; }
+    const GlyphBmp& Get(uint32_t cp, int sub) {
+        auto it = cache.find(cp * 4 + sub);
+        if (it != cache.end()) return it->second;
+        GlyphBmp& g = cache[cp * 4 + sub];
+        float sx = sub * 0.25f;
+        int x0, y0, x1, y1;
+        stbtt_GetCodepointBitmapBoxSubpixel(&file->info, (int)cp, scale, scale, sx, 0, &x0, &y0, &x1, &y1);
+        g.w = x1 - x0; g.h = y1 - y0; g.x0 = x0; g.y0 = y0;
+        if (g.w > 0 && g.h > 0) {
+            g.a.assign((size_t)g.w * g.h, 0);
+            stbtt_MakeCodepointBitmapSubpixel(&file->info, g.a.data(), g.w, g.h, g.w, scale, scale, sx, 0, (int)cp);
+        }
+        return g;
     }
-    void Text(const std::wstring& s, HFONT f, COLORREF c, RECT r, UINT flags) { SelectObject(dc, f); SetTextColor(dc, c); DrawTextW(dc, s.c_str(), -1, &r, flags | DT_NOPREFIX); }
-    // A button: lit = hovered, on = held or active.
-    void Button(RECT b, const std::wstring& label, const std::wstring& sub, bool lit, bool on, COLORREF base = RGB(48, 62, 84)) {
-        COLORREF bg = on ? RGB(40, 150, 255) : lit ? RGB(64, 92, 130) : base;
-        Round(b, 30, lit || on ? RGB(170, 215, 255) : RGB(80, 100, 130));
-        Round({ b.left + 3, b.top + 3, b.right - 3, b.bottom - 3 }, 26, bg);
-        if (sub.empty()) Text(label, fBtn, RGB(245, 250, 255), b, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-        else {
-            Text(label, fBtn, RGB(245, 250, 255), { b.left + 6, b.top + 8, b.right - 6, (b.top + b.bottom) / 2 + 6 }, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-            Text(sub, fSmall, RGB(200, 215, 230), { b.left + 6, (b.top + b.bottom) / 2 + 2, b.right - 6, b.bottom - 6 }, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+};
+static Font g_fTitle, g_fHead, g_fBtn, g_fText, g_fSmall;
+static bool g_fontsOk = false;
+
+// A panel picture (BGRA, opaque): rectangles, rounded rectangles, text, buttons.
+struct Panel {
+    int W = 0, H = 0;
+    std::vector<uint32_t> px;
+    Font *fTitle = &g_fTitle, *fHead = &g_fHead, *fBtn = &g_fBtn, *fText = &g_fText, *fSmall = &g_fSmall;
+    bool Init(int w, int h) {
+        W = w; H = h;
+        px.assign((size_t)W * H, 0xFF000000u);
+        static bool once = false;
+        if (!once) {
+            once = true;
+            g_fontsOk = g_fTitle.Init(2, 44) && g_fHead.Init(2, 32) && g_fBtn.Init(1, 30) && g_fText.Init(0, 27) && g_fSmall.Init(0, 23);
+        }
+        return g_fontsOk;
+    }
+    void Blend(int x, int y, Colour c, float a) {
+        if (x < 0 || y < 0 || x >= W || y >= H || a <= 0) return;
+        uint32_t& d = px[(size_t)y * W + x];
+        float s[3] = { float(c & 255), float((c >> 8) & 255), float((c >> 16) & 255) };   // r g b
+        float o[3] = { float((d >> 16) & 255), float((d >> 8) & 255), float(d & 255) };
+        a = std::min(a, 1.0f);
+        uint32_t r = (uint32_t)(o[0] + (s[0] - o[0]) * a + 0.5f), g = (uint32_t)(o[1] + (s[1] - o[1]) * a + 0.5f), b = (uint32_t)(o[2] + (s[2] - o[2]) * a + 0.5f);
+        d = 0xFF000000u | (r << 16) | (g << 8) | b;
+    }
+    void Fill(IRect r, Colour c) {
+        for (int y = std::max(0, r.top); y < std::min(H, r.bottom); ++y)
+            for (int x = std::max(0, r.left); x < std::min(W, r.right); ++x) Blend(x, y, c, 1);
+    }
+    // As GDI's RoundRect: rad is the corners' diameter.
+    void Round(IRect r, int rad, Colour c) {
+        float R = rad * 0.5f, cx0 = r.left + R, cx1 = r.right - R, cy0 = r.top + R, cy1 = r.bottom - R;
+        for (int y = std::max(0, r.top); y < std::min(H, r.bottom); ++y)
+            for (int x = std::max(0, r.left); x < std::min(W, r.right); ++x) {
+                float fx = x + 0.5f, fy = y + 0.5f;
+                float dx = std::max({ cx0 - fx, fx - cx1, 0.0f }), dy = std::max({ cy0 - fy, fy - cy1, 0.0f });
+                float d = sqrtf(dx * dx + dy * dy) - R;
+                Blend(x, y, c, std::clamp(0.5f - d, 0.0f, 1.0f));
+            }
+    }
+    float Measure(const std::wstring& s, Font* f) const {
+        if (!f || !f->file || !f->file->ok) return 0;
+        float x = 0; uint32_t prev = 0;
+        for (wchar_t ch : s) { uint32_t cp = (uint32_t)ch; if (prev) x += f->Kern(prev, cp); x += f->Advance(cp); prev = cp; }
+        return x;
+    }
+    void Line(const std::wstring& s, Font* f, Colour c, float x, int base, IRect clip) {
+        uint32_t prev = 0;
+        for (wchar_t ch : s) {
+            uint32_t cp = (uint32_t)ch;
+            if (prev) x += f->Kern(prev, cp);
+            int ix = (int)floorf(x), sub = std::min(3, (int)((x - ix) * 4));
+            const GlyphBmp& g = f->Get(cp, sub);
+            for (int gy = 0; gy < g.h; ++gy) {
+                int y = base + g.y0 + gy;
+                if (y < clip.top || y >= clip.bottom) continue;
+                for (int gx = 0; gx < g.w; ++gx) {
+                    int xx = ix + g.x0 + gx;
+                    if (xx < clip.left || xx >= clip.right) continue;
+                    if (uint8_t a = g.a[(size_t)gy * g.w + gx]) Blend(xx, y, c, a / 255.0f);
+                }
+            }
+            x += f->Advance(cp);
+            prev = cp;
         }
     }
-    std::vector<uint32_t> Pixels() {
-        GdiFlush();
-        std::vector<uint32_t> px((const uint32_t*)bits, (const uint32_t*)bits + W * H);
-        for (auto& p : px) p |= 0xFF000000u;
-        return px;
+    // As GDI's DrawText with these flags: alignment, one line or several (\n, word wrap), "..." when too long.
+    void Text(const std::wstring& s, Font* f, Colour c, IRect r, unsigned flags) {
+        if (!f || !f->file || !f->file->ok) return;
+        const float width = (float)(r.right - r.left);
+        std::vector<std::wstring> lines;
+        if (flags & TX_SINGLELINE) { std::wstring l = s; std::replace(l.begin(), l.end(), L'\n', L' '); lines.push_back(l); }
+        else {
+            std::wstring cur;
+            for (size_t i = 0; i <= s.size(); ++i) {
+                if (i < s.size() && s[i] != L'\n') { cur += s[i]; continue; }
+                if (!(flags & TX_WORDBREAK) || Measure(cur, f) <= width) { lines.push_back(cur); cur.clear(); continue; }
+                std::wstring line;   // word wrap: as many words as fit
+                size_t p = 0;
+                while (p < cur.size()) {
+                    size_t q = cur.find(L' ', p);
+                    if (q == std::wstring::npos) q = cur.size();
+                    std::wstring word = cur.substr(p, q - p);
+                    std::wstring tryLine = line.empty() ? word : line + L" " + word;
+                    if (!line.empty() && Measure(tryLine, f) > width) { lines.push_back(line); line = word; }
+                    else line = tryLine;
+                    p = q + 1;
+                }
+                lines.push_back(line);
+                cur.clear();
+            }
+        }
+        if (flags & TX_END_ELLIPSIS) {
+            const std::wstring dots = f->Has(0x2026) ? std::wstring(1, (wchar_t)0x2026) : std::wstring(L"...");
+            for (auto& l : lines) {
+                if (Measure(l, f) <= width) continue;
+                while (!l.empty() && Measure(l + dots, f) > width) l.pop_back();
+                while (!l.empty() && l.back() == L' ') l.pop_back();
+                l += dots;
+            }
+        }
+        const int lineH = f->lineH, pad = (f->lineH - (f->ascent - f->descent)) / 2;
+        int y = r.top;
+        if ((flags & TX_SINGLELINE) && (flags & TX_VCENTER)) y = r.top + (r.bottom - r.top - lineH) / 2;
+        for (auto& l : lines) {
+            float w = Measure(l, f);
+            float x = (flags & TX_CENTER) ? r.left + (width - w) * 0.5f : (flags & TX_RIGHT) ? r.right - w : (float)r.left;
+            Line(l, f, c, x, y + pad + f->ascent, { std::max(r.left, 0), std::max(r.top, 0), std::min(r.right, W), std::min(r.bottom, H) });
+            y += lineH;
+        }
     }
+    // A button: lit = hovered, on = held or active.
+    void Button(IRect b, const std::wstring& label, const std::wstring& sub, bool lit, bool on, Colour base = RGB(48, 62, 84)) {
+        Colour bg = on ? RGB(40, 150, 255) : lit ? RGB(64, 92, 130) : base;
+        Round(b, 30, lit || on ? RGB(170, 215, 255) : RGB(80, 100, 130));
+        Round({ b.left + 3, b.top + 3, b.right - 3, b.bottom - 3 }, 26, bg);
+        if (sub.empty()) Text(label, fBtn, RGB(245, 250, 255), b, TX_CENTER | TX_SINGLELINE | TX_VCENTER | TX_END_ELLIPSIS);
+        else {
+            Text(label, fBtn, RGB(245, 250, 255), { b.left + 6, b.top + 8, b.right - 6, (b.top + b.bottom) / 2 + 6 }, TX_CENTER | TX_SINGLELINE | TX_VCENTER | TX_END_ELLIPSIS);
+            Text(sub, fSmall, RGB(200, 215, 230), { b.left + 6, (b.top + b.bottom) / 2 + 2, b.right - 6, b.bottom - 6 }, TX_CENTER | TX_SINGLELINE | TX_VCENTER | TX_END_ELLIPSIS);
+        }
+    }
+    std::vector<uint32_t> Pixels() const { return px; }
 };
 
 // Guide panel (edit mode): buttons along the top, then the controls, handle legend and status.
 static const int kGuideW = 1900, kGuideH = 1080;
 static const float kGuideWidthM = 0.95f;
 enum GuideBtn { GB_NEW, GB_DELETE, GB_COLOUR, GB_ALL, GB_P1, GB_P2, GB_P3, GB_DONE, GB_COUNT };
-static RECT GuideBtnRect(int i) {
+static IRect GuideBtnRect(int i) {
     const int x0 = 30, gap = 14, w = (kGuideW - 2 * x0 - gap * (GB_COUNT - 1)) / GB_COUNT;
     return { x0 + i * (w + gap), 104, x0 + i * (w + gap) + w, 214 };
 }
 static int GuideBtnAt(int x, int y) {
-    for (int i = 0; i < GB_COUNT; ++i) { RECT r = GuideBtnRect(i); if (x >= r.left - 6 && x < r.right + 6 && y >= r.top - 6 && y < r.bottom + 6) return i; }
+    for (int i = 0; i < GB_COUNT; ++i) { IRect r = GuideBtnRect(i); if (x >= r.left - 6 && x < r.right + 6 && y >= r.top - 6 && y < r.bottom + 6) return i; }
     return -1;
 }
 static float g_guideMoveU = -1, g_guideMoveV = -1, g_dashMoveU = -1, g_dashMoveV = -1;   // last laser point (mouse) on each panel
 // --export-pictures: the guide and dashboard panels drawn into these pixels instead of SteamVR.
 static bool g_exporting = false;
 static std::vector<uint32_t> g_exportPx;
-static Gdi g_guideGdi;
-static ID3D11Texture2D* g_guideTex = nullptr;
+static Panel g_guidePanel;
+static Tex* g_guideTex = nullptr;
 static std::wstring g_guideKey;
 static int g_guideHover = -1, g_guideHeld = -1;
 static double g_guideHeldSince = 0;
@@ -1008,13 +1491,20 @@ static XMFLOAT4X4 g_guideM;   // panel frame (world)
 
 static XMVECTOR GuideNormal() { return XMVector3Normalize(XMLoadFloat4x4(&g_guideM).r[2]); }
 
+#ifdef _WIN32
+static const wchar_t* kKeysTitle = L"KEYBOARD  (Ctrl+Alt + key)";
+#define AVVR_EDIT_KEY L"Ctrl+Alt+E"
+#else
+static const wchar_t* kKeysTitle = L"KEYBOARD  (Windows only)";
+#define AVVR_EDIT_KEY L"Ctrl+Alt+E on Windows"
+#endif
 static void RenderGuide() {
     // What it shows; redrawn only when that changes.
     std::wstring sel;
     if (g_selected >= 0 && g_selected < (int)g_windows.size()) {
         const Window& w = g_windows[g_selected];
-        sel = Fmt(L"Window %d of %d  ·  %.0f x %.0f cm  ·  %s%s  ·  %.1f m away", g_selected + 1, (int)g_windows.size(), w.hw * 200, w.hh * 200,
-                  IsShape(w) ? L"free shape" : w.ellipse ? L"circle" : L"rectangle", ((w.lock ? std::wstring(L", angle locked") : std::wstring()) + (w.hd > 0 ? Fmt(L", box %.0f cm deep (%s)", w.hd * 200, Widen(kBoxModeName[w.boxMode]).c_str()) : std::wstring())).c_str(), Dist(g_head, V(w.pos)));
+        sel = Fmt(L"Window %d of %d  ·  %.0f x %.0f cm  ·  %ls%ls  ·  %.1f m away", g_selected + 1, (int)g_windows.size(), w.hw * 200, w.hh * 200,
+                  IsShape(w) ? L"free shape" : w.ellipse ? L"circle" : L"rectangle", ((w.lock ? std::wstring(L", angle locked") : std::wstring()) + (w.hd > 0 ? Fmt(L", box %.0f cm deep (%ls)", w.hd * 200, Widen(kBoxModeName[w.boxMode]).c_str()) : std::wstring())).c_str(), Dist(g_head, V(w.pos)));
     } else sel = g_windows.empty() ? L"No windows yet: New window (above) makes one" : Fmt(L"None selected (%d windows): point at one and pull the trigger", (int)g_windows.size());
     if (g_drawArmed >= 0) sel += L"\nDrawing: hold the trigger on the window and trace the outline, let go to finish";
     if (Now() < g_windowsFullUntil) sel += Fmt(L"\n%d windows is the most: delete one to make another", kMaxWindows);
@@ -1026,17 +1516,17 @@ static void RenderGuide() {
                      + Widen(g_gameName + g_cameraStatus);
     if (key == g_guideKey && g_guideTex) return;
     g_guideKey = key;
-    Gdi& g = g_guideGdi;
-    const COLORREF cHead = RGB(110, 230, 170), cText = RGB(232, 236, 242), cDim = RGB(150, 158, 170), cLine = RGB(52, 58, 68);
+    Panel& g = g_guidePanel;
+    const Colour cHead = RGB(110, 230, 170), cText = RGB(232, 236, 242), cDim = RGB(150, 158, 170), cLine = RGB(52, 58, 68);
     g.Fill({ 0, 0, kGuideW, kGuideH }, RGB(22, 25, 31));
     g.Fill({ 0, 0, kGuideW, 86 }, RGB(30, 70, 60));
-    g.Text(L"ALPHA VIEWS VR  ·  EDIT MODE", g.fTitle, RGB(235, 255, 245), { 36, 0, kGuideW - 36, 86 }, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    g.Text(L"Point the laser, pull the trigger (or grip)  ·  grab this panel to move it", g.fSmall, RGB(170, 210, 195), { 36, 0, kGuideW - 36, 86 }, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    g.Text(L"ALPHA VIEWS VR  ·  EDIT MODE", g.fTitle, RGB(235, 255, 245), { 36, 0, kGuideW - 36, 86 }, TX_LEFT | TX_SINGLELINE | TX_VCENTER);
+    g.Text(L"Point the laser, pull the trigger (or grip)  ·  grab this panel to move it", g.fSmall, RGB(170, 210, 195), { 36, 0, kGuideW - 36, 86 }, TX_RIGHT | TX_SINGLELINE | TX_VCENTER);
     static const wchar_t* kLabel[GB_COUNT] = { L"New window", L"Delete", L"Colour", L"Move all", L"Preset 1", L"Preset 2", L"Preset 3", L"Done" };
     for (int i = 0; i < GB_COUNT; ++i) {
         std::wstring sub;
         bool on = g_guideHeld == i;
-        COLORREF base = RGB(48, 62, 84);
+        Colour base = RGB(48, 62, 84);
         if (i == GB_COLOUR) sub = Widen(kKeyName[g_keyMode]);
         if (i == GB_ALL) sub = on ? L"moving: let go to place" : L"hold and move";
         if (i == GB_DELETE) sub = g_selected >= 0 ? Fmt(L"window %d", g_selected + 1) : L"none selected";
@@ -1054,7 +1544,7 @@ static void RenderGuide() {
     }
     // Columns: laser controls, keyboard, status.
     const int top = 250, x1 = 36, x2 = 760, x3 = 1330, xEnd = kGuideW - 36;
-    g.Text(L"LASER (edit mode)", g.fHead, cHead, { x1, top, x2, top + 44 }, DT_LEFT | DT_SINGLELINE);
+    g.Text(L"LASER (edit mode)", g.fHead, cHead, { x1, top, x2, top + 44 }, TX_LEFT | TX_SINGLELINE);
     static const wchar_t* kLaser[] = {
         L"Trigger or grip on a window: select it and move it",
         L"While holding it, thumbstick up / down: push / pull",
@@ -1062,22 +1552,22 @@ static void RenderGuide() {
         L"Box handle (green): tap = box, hold + thumbstick = depth",
     };
     int y = top + 54;
-    for (auto* s : kLaser) { g.Text(s, g.fText, cText, { x1, y, x2 - 30, y + 40 }, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS); y += 44; }
-    g.Text(L"KEYBOARD  (Ctrl+Alt + key)", g.fHead, cHead, { x2, top, x3, top + 44 }, DT_LEFT | DT_SINGLELINE);
+    for (auto* s : kLaser) { g.Text(s, g.fText, cText, { x1, y, x2 - 30, y + 40 }, TX_LEFT | TX_SINGLELINE | TX_END_ELLIPSIS); y += 44; }
+    g.Text(kKeysTitle, g.fHead, cHead, { x2, top, x3, top + 44 }, TX_LEFT | TX_SINGLELINE);
     static const wchar_t* kKeys[][2] = { { L"E", L"Edit mode on / off" }, { L"N", L"New window" }, { L"X", L"Delete all windows" },
         { L"P", L"Windows on / off" }, { L"C", L"Colour" }, { L"G", L"Hide this panel" }, { L"1 2 3", L"Load preset (+Shift: save)" } };
     y = top + 54;
     for (auto& k : kKeys) {
         g.Round({ x2, y + 2, x2 + 76, y + 38 }, 12, RGB(70, 78, 92));
-        g.Text(k[0], g.fSmall, RGB(245, 248, 252), { x2, y + 2, x2 + 76, y + 38 }, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-        g.Text(k[1], g.fText, cText, { x2 + 92, y, x3 - 30, y + 40 }, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        g.Text(k[0], g.fSmall, RGB(245, 248, 252), { x2, y + 2, x2 + 76, y + 38 }, TX_CENTER | TX_SINGLELINE | TX_VCENTER);
+        g.Text(k[1], g.fText, cText, { x2 + 92, y, x3 - 30, y + 40 }, TX_LEFT | TX_SINGLELINE | TX_VCENTER | TX_END_ELLIPSIS);
         y += 44;
     }
-    g.Text(L"STATUS", g.fHead, cHead, { x3, top, xEnd, top + 44 }, DT_LEFT | DT_SINGLELINE);
-    std::wstring st = Widen("Game: " + g_gameName) + Fmt(L"\nWindows: %d%s", (int)g_windows.size(), g_windowsOn ? L"" : L" (hidden: Ctrl+Alt+P)")
+    g.Text(L"STATUS", g.fHead, cHead, { x3, top, xEnd, top + 44 }, TX_LEFT | TX_SINGLELINE);
+    std::wstring st = Widen("Game: " + g_gameName) + Fmt(L"\nWindows: %d%ls", (int)g_windows.size(), g_windowsOn ? L"" : L" (hidden: dashboard / Ctrl+Alt+P)")
                     + L"\nColour: " + Widen(kKeyName[g_keyMode]) + L"\nCamera: " + Widen(g_cameraStatus);
-    RECT sr{ x3, top + 54, xEnd, top + 54 + 300 };
-    g.Text(st, g.fText, cText, sr, DT_LEFT | DT_WORDBREAK);
+    IRect sr{ x3, top + 54, xEnd, top + 54 + 300 };
+    g.Text(st, g.fText, cText, sr, TX_LEFT | TX_WORDBREAK);
     for (int x : { x2 - 22, x3 - 22 }) g.Fill({ x, top, x + 3, top + 360 }, cLine);
     // Handle legend.
     y = top + 380;
@@ -1093,40 +1583,39 @@ static void RenderGuide() {
     };
     static const wchar_t* words[] = { L"move", L"resize (tiny = delete)", L"round corner", L"free shape", L"circle", L"draw outline",
                                       L"point (tap = remove)", L"add point", L"lock angle", L"snap upright / level", L"box depth (tap / thumbstick)", L"box faces (cycle)" };
-    g.Text(L"HANDLES", g.fHead, cHead, { x1, y, xEnd, y + 44 }, DT_LEFT | DT_SINGLELINE);
+    g.Text(L"HANDLES", g.fHead, cHead, { x1, y, xEnd, y + 44 }, TX_LEFT | TX_SINGLELINE);
     y += 54;
     std::vector<std::pair<int, int>> spots;
     int x = x1;
-    for (size_t i = 0; i < _countof(legend); ++i) {
-        SelectObject(g.dc, g.fText);
-        RECT need{ 0, 0, 600, 40 }; DrawTextW(g.dc, words[i], -1, &need, DT_CALCRECT | DT_SINGLELINE);
-        if (x + 56 + need.right > xEnd) { x = x1; y += 52; }
+    for (size_t i = 0; i < std::size(legend); ++i) {
+        int needW = (int)ceilf(g.Measure(words[i], g.fText));
+        if (x + 56 + needW > xEnd) { x = x1; y += 52; }
         spots.push_back({ x + 22, y + 21 });
-        g.Text(words[i], g.fText, cText, { x + 54, y, x + 54 + need.right + 4, y + 42 }, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        x += 54 + need.right + 46;
+        g.Text(words[i], g.fText, cText, { x + 54, y, x + 54 + needW + 4, y + 42 }, TX_LEFT | TX_SINGLELINE | TX_VCENTER);
+        x += 54 + needW + 46;
     }
     y += 70;
     g.Fill({ x1, y, xEnd, y + 2 }, cLine);
     y += 16;
-    g.Text(L"SELECTED WINDOW", g.fHead, cHead, { x1, y, xEnd, y + 44 }, DT_LEFT | DT_SINGLELINE);
-    g.Text(sel, g.fText, cText, { x1, y + 52, xEnd, kGuideH - 10 }, DT_LEFT | DT_WORDBREAK);
+    g.Text(L"SELECTED WINDOW", g.fHead, cHead, { x1, y, xEnd, y + 44 }, TX_LEFT | TX_SINGLELINE);
+    g.Text(sel, g.fText, cText, { x1, y + 52, xEnd, kGuideH - 10 }, TX_LEFT | TX_WORDBREAK);
     std::vector<uint32_t> px = g.Pixels();
     for (size_t i = 0; i < spots.size(); ++i) PaintIcon(px.data(), kGuideW, kGuideH, spots[i].first, spots[i].second, 20.0f, legend[i], false);
     if (g_exporting) { g_exportPx = std::move(px); return; }
-    if (!g_guideTex) g_guideTex = MakeTexture(kGuideW, kGuideH, DXGI_FORMAT_B8G8R8A8_UNORM, px.data(), false);
-    else g_ctx->UpdateSubresource(g_guideTex, 0, nullptr, px.data(), kGuideW * 4, 0);
+    if (!g_guideTex) g_guideTex = MakeTexture(kGuideW, kGuideH, px.data());
+    else Upload(g_guideTex, px.data());
     SetTex(g_guideOv, g_guideTex);
 }
 
 // Dashboard panel (the bottom-bar entry in the SteamVR dashboard).
 static const int kDashW = 1600, kDashH = 900;
 enum DashBtn { DB_EDIT, DB_WINDOWS, DB_COLOUR, DB_GUIDE, DB_AUTOSTART, DB_DELALL, DB_COUNT };
-static RECT DashBtnRect(int i) {
+static IRect DashBtnRect(int i) {
     int col = i % 3, row = i / 3, w = 480, h = 150;
     return { 40 + col * (w + 20), 150 + row * (h + 24), 40 + col * (w + 20) + w, 150 + row * (h + 24) + h };
 }
-static Gdi g_dashGdi;
-static ID3D11Texture2D* g_dashTex = nullptr;
+static Panel g_dashPanel;
+static Tex* g_dashTex = nullptr;
 static std::wstring g_dashKey;
 static int g_dashHover = -1, g_dashHeld = -1;
 static double g_dashHeldSince = 0;
@@ -1138,13 +1627,13 @@ static void RenderDash() {
                      + Widen(g_gameName + g_cameraStatus);
     if (key == g_dashKey && g_dashTex) return;
     g_dashKey = key;
-    Gdi& g = g_dashGdi;
-    const COLORREF cHead = RGB(110, 230, 170), cText = RGB(232, 236, 242), cDim = RGB(150, 158, 170);
+    Panel& g = g_dashPanel;
+    const Colour cHead = RGB(110, 230, 170), cText = RGB(232, 236, 242), cDim = RGB(150, 158, 170);
     g.Fill({ 0, 0, kDashW, kDashH }, RGB(22, 25, 31));
     g.Fill({ 0, 0, kDashW, 110 }, RGB(30, 70, 60));
-    g.Text(L"Alpha Views VR", g.fTitle, RGB(235, 255, 245), { 40, 0, kDashW - 40, 110 }, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    g.Text(Widen(std::string("version ") + AVVR_VERSION + "  ·  by GmoLargey"), g.fSmall, RGB(170, 210, 195), { 40, 0, kDashW - 40, 110 }, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
-    struct B { const wchar_t* label; std::wstring sub; bool on; COLORREF base; };
+    g.Text(L"Alpha Views VR", g.fTitle, RGB(235, 255, 245), { 40, 0, kDashW - 40, 110 }, TX_LEFT | TX_SINGLELINE | TX_VCENTER);
+    g.Text(Widen(std::string("version ") + AVVR_VERSION + "  ·  by GmoLargey"), g.fSmall, RGB(170, 210, 195), { 40, 0, kDashW - 40, 110 }, TX_RIGHT | TX_SINGLELINE | TX_VCENTER);
+    struct B { const wchar_t* label; std::wstring sub; bool on; Colour base; };
     B b[DB_COUNT] = {
         { g_edit ? L"Finish editing" : L"Edit windows", g_edit ? L"on: close the dashboard to edit" : L"move, resize, add windows", g_edit, RGB(30, 110, 70) },
         { g_windowsOn ? L"Windows: on" : L"Windows: off", g_windowsOn ? L"click to hide them" : L"click to show them", false, RGB(48, 62, 84) },
@@ -1155,18 +1644,18 @@ static void RenderDash() {
     };
     for (int i = 0; i < DB_COUNT; ++i) g.Button(DashBtnRect(i), b[i].label, b[i].sub, g_dashHover == i, b[i].on, b[i].base);
     int y = 150 + 2 * 174 + 20;
-    g.Text(L"STATUS", g.fHead, cHead, { 40, y, kDashW - 40, y + 44 }, DT_LEFT | DT_SINGLELINE);
+    g.Text(L"STATUS", g.fHead, cHead, { 40, y, kDashW - 40, y + 44 }, TX_LEFT | TX_SINGLELINE);
     std::wstring st = Widen("Game: " + g_gameName) + Fmt(L"   ·   Windows for this game: %d", (int)g_windows.size())
                     + L"\nHeadset camera: " + Widen(g_cameraStatus)
                     + L"\nColour-key streamers (e.g. Virtual Desktop): set the same colour there as here.";
-    g.Text(st, g.fText, cText, { 40, y + 52, kDashW - 40, y + 200 }, DT_LEFT | DT_WORDBREAK);
-    g.Text(L"Edit mode: Edit windows (above) or Ctrl+Alt+E; finish with Done on the guide panel or here.  In edit mode SteamVR's laser pointer\n"
+    g.Text(st, g.fText, cText, { 40, y + 52, kDashW - 40, y + 200 }, TX_LEFT | TX_WORDBREAK);
+    g.Text(L"Edit mode: Edit windows (above) or " AVVR_EDIT_KEY L"; finish with Done on the guide panel or here.  In edit mode SteamVR's laser pointer\n"
            L"works the windows and the game gets no controller input until you finish.",
-           g.fSmall, cDim, { 40, kDashH - 110, kDashW - 40, kDashH - 20 }, DT_LEFT | DT_WORDBREAK);
+           g.fSmall, cDim, { 40, kDashH - 110, kDashW - 40, kDashH - 20 }, TX_LEFT | TX_WORDBREAK);
     std::vector<uint32_t> px = g.Pixels();
     if (g_exporting) { g_exportPx = std::move(px); return; }
-    if (!g_dashTex) g_dashTex = MakeTexture(kDashW, kDashH, DXGI_FORMAT_B8G8R8A8_UNORM, px.data(), false);
-    else g_ctx->UpdateSubresource(g_dashTex, 0, nullptr, px.data(), kDashW * 4, 0);
+    if (!g_dashTex) g_dashTex = MakeTexture(kDashW, kDashH, px.data());
+    else Upload(g_dashTex, px.data());
     SetTex(g_dashOv, g_dashTex);
 }
 static void MakeDashThumb() {
@@ -1182,7 +1671,7 @@ static void MakeDashThumb() {
         }
     IconLook mv{ ICON_MOVE, { 0.15f, 0.45f, 1 } };
     PaintIcon(px.data(), n, n, n / 2, n / 2, 40, mv, false);
-    ID3D11Texture2D* t = MakeTexture(n, n, DXGI_FORMAT_B8G8R8A8_UNORM, px.data(), false);
+    Tex* t = MakeTexture(n, n, px.data());
     SetTex(g_dashThumb, t);
 }
 
@@ -1541,7 +2030,7 @@ static void ShowHandles(const std::vector<UiIcon>& icons) {
             continue;
         }
         const UiIcon& u = icons[i];
-        ID3D11Texture2D* t = IconTexture(u.look);
+        Tex* t = IconTexture(u.look);
         if (t != h.tex) { SetTex(h.ov, t); h.tex = t; }
         // Facing: buttons face your head; move, corner and rounding handles lie in the window's plane.
         XMVECTOR x, y, z;
@@ -1689,16 +2178,16 @@ static bool BoxView(const Window& w, const std::vector<XMFLOAT2>& per, const std
 // selected in edit mode (its handles must stay in front) and in camera mode (one picture per box).
 // The front face is the window's own overlay (moved out to the front); the back and the sides come from
 // this pool, shared by all boxes.
-struct FaceOv { vr::VROverlayHandle_t ov = vr::k_ulOverlayHandleInvalid; bool shown = false, inter = false; int mirror = -1; ID3D11Texture2D* tex = nullptr; int win = -1; };
+struct FaceOv { vr::VROverlayHandle_t ov = vr::k_ulOverlayHandleInvalid; bool shown = false, inter = false; int mirror = -1; Tex* tex = nullptr; uint32_t texVer = 0; int win = -1; };
 static std::vector<FaceOv> g_faceOv;
 static bool g_facePoolFull = false;
-static ID3D11Texture2D* g_solidTex[3] = {};
-static ID3D11Texture2D* SolidTexture(int key) {
+static Tex* g_solidTex[3] = {};
+static Tex* SolidTexture(int key) {
     if (!g_solidTex[key]) {
         const float* c = kKeyCol[key];
         uint32_t px[16];
         for (auto& p : px) p = 0xFF000000u | (uint32_t(c[0] * 255) << 16) | (uint32_t(c[1] * 255) << 8) | uint32_t(c[2] * 255);
-        g_solidTex[key] = MakeTexture(4, 4, DXGI_FORMAT_B8G8R8A8_UNORM, px, false);
+        g_solidTex[key] = MakeTexture(4, 4, px);
     }
     return g_solidTex[key];
 }
@@ -1715,13 +2204,13 @@ static bool FaceShown(int mode, int k) {
     default: return true;
     }
 }
-struct Face { XMVECTOR c, x, y, z; float w, h; ID3D11Texture2D* tex; bool mirror; int win; };
+struct Face { XMVECTOR c, x, y, z; float w, h; Tex* tex; bool mirror; int win; };
 static bool UseRealFaces(const Window& w, int wi) {
-    bool camera = g_keyMode == 3 && g_camFrameOk && g_camSrv;
+    bool camera = g_keyMode == 3 && g_camFrameOk && !g_camPx.empty();
     return w.hd > 0 && !camera && !(g_edit && g_selected == wi);
 }
 // The back face and the sides of a box (the front face is the window's overlay).
-static void BoxFaces(const Window& w, int wi, ID3D11Texture2D* capTex, std::vector<Face>& out) {
+static void BoxFaces(const Window& w, int wi, Tex* capTex, std::vector<Face>& out) {
     XMVECTOR q = XMLoadFloat4(&w.rot);
     XMVECTOR wx = XMVector3Rotate(XMVectorSet(1, 0, 0, 0), q), wy = XMVector3Rotate(XMVectorSet(0, 1, 0, 0), q), wz = XMVector3Rotate(XMVectorSet(0, 0, 1, 0), q);
     XMVECTOR c = V(w.pos);
@@ -1759,7 +2248,7 @@ static void ShowFaces(const std::vector<Face>& faces) {
             continue;
         }
         const Face& fc = faces[i];
-        if (fc.tex != f.tex) { SetTex(f.ov, fc.tex); f.tex = fc.tex; }
+        if (fc.tex != f.tex || (fc.tex && fc.tex->version != f.texVer)) { SetTex(f.ov, fc.tex); f.tex = fc.tex; f.texVer = fc.tex ? fc.tex->version : 0; }
         // An overlay is drawn from its front: if you're behind this face, turn it round and mirror.
         XMVECTOR x = fc.x, z = fc.z;
         bool mirror = fc.mirror;
@@ -1799,7 +2288,7 @@ static void RenderWindow(int wi, WinOv& o, bool selected, bool hover, bool camNe
     const Window& w = g_windows[wi];
     const bool real = UseRealFaces(w, wi);   // a box drawn face by face: this is its (flat) front face
     std::string look = WindowLook(w, selected, hover) + (real ? " real" : "");
-    bool camera = g_keyMode == 3 && g_camFrameOk && g_camSrv;
+    bool camera = g_keyMode == 3 && g_camFrameOk && !g_camPx.empty();
     // Redrawn when it changes; boxes and the camera every frame (they change as you move).
     bool every = camera || (w.hd > 0 && !real);
     WinView v;
@@ -1818,7 +2307,6 @@ static void RenderWindow(int wi, WinOv& o, bool selected, bool hover, bool camNe
     if (camera) {
         XMStoreFloat4x4(&cb.toCam, XMLoadFloat4x4(&v.frame) * XMLoadFloat4x4(&g_camWorldToClip));
         cb.camRect = g_camRect;
-        g_ctx->PSSetShaderResources(0, 1, &g_camSrv);
     }
     DrawTris(v.tris, cb);
     // Edit mode: the selected window's outline (white), or the one the laser is on (grey). A box: its
@@ -1836,8 +2324,6 @@ static void RenderWindow(int wi, WinOv& o, bool selected, bool hover, bool camNe
             DrawTris(rib, oc);
         }
     }
-    ID3D11ShaderResourceView* none = nullptr;
-    g_ctx->PSSetShaderResources(0, 1, &none);
     o.cv.End();
     SetTex(o.ov, o.cv.tex);
 }
@@ -2063,7 +2549,7 @@ static void HandleDashEvents(double now) {
         if (ev.eventType == vr::VREvent_MouseMove) { g_dashMoveU = ev.data.mouse.x; g_dashMoveV = 0.5f + (ev.data.mouse.y - 0.5f) * kDashW / kDashH; }
         if (ev.eventType == vr::VREvent_MouseMove || ev.eventType == vr::VREvent_MouseButtonDown) {
             int x = (int)(g_dashMoveU * kDashW), y = (int)((1 - g_dashMoveV) * kDashH);
-            for (int i = 0; i < DB_COUNT; ++i) { RECT r = DashBtnRect(i); if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) b = i; }
+            for (int i = 0; i < DB_COUNT; ++i) { IRect r = DashBtnRect(i); if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) b = i; }
         }
         if (ev.eventType == vr::VREvent_MouseMove) g_dashHover = b;
         else if (ev.eventType == vr::VREvent_FocusLeave) { g_dashHover = -1; g_dashHeld = -1; }
@@ -2092,6 +2578,8 @@ static void HandleDashEvents(double now) {
 }
 
 // ================================================================ keyboard and controllers (outside edit mode)
+// Ctrl+Alt hotkeys: Windows only (Linux desktops give no global keys without a window).
+#ifdef _WIN32
 static bool KeyPressed(int vk) {
     static bool down[256] = {};
     bool now = (GetAsyncKeyState(vk) & 0x8000) && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_MENU) & 0x8000);
@@ -2109,6 +2597,9 @@ static void HandleKeys() {
     if (KeyPressed('G')) { g_guideOn = !g_guideOn; SaveSettings(); Log("Guide panel %s\n", g_guideOn ? "on" : "off"); }
     for (int i = 0; i < 3; ++i) if (KeyPressed('1' + i)) { if (shift) SavePreset(i); else LoadPreset(i); }
 }
+#else
+static void HandleKeys() {}
+#endif
 
 
 // ================================================================ the game in the scene
@@ -2131,38 +2622,33 @@ static void CheckGame() {
 // ================================================================ main
 static void RegisterApp(const std::string& exeDir) {
     auto* apps = vr::VRApplications();
-    std::string manifest = exeDir + "\\alphaviewsvr.vrmanifest";
+    std::string manifest = exeDir + "/alphaviewsvr.vrmanifest";
     vr::EVRApplicationError e = apps->AddApplicationManifest(manifest.c_str(), false);
     if (e != vr::VRApplicationError_None) Log("AddApplicationManifest: %s\n", apps->GetApplicationsErrorNameFromEnum(e));
-    apps->IdentifyApplication(GetCurrentProcessId(), kAppKey);
+    apps->IdentifyApplication(ProcessId(), kAppKey);
     // First run: start with SteamVR (the dashboard button turns it off).
-    bool first = GetFileAttributesA((g_dir + "\\autostart_set.flag").c_str()) == INVALID_FILE_ATTRIBUTES;
+    bool first = !FileExists(g_dir + "/autostart_set.flag");
     if (first) {
         apps->SetApplicationAutoLaunch(kAppKey, true);
-        if (FILE* f = fopen((g_dir + "\\autostart_set.flag").c_str(), "w")) fclose(f);
+        if (FILE* f = OpenFile((g_dir + "/autostart_set.flag").c_str(), "w")) fclose(f);
     }
     g_autoStart = apps->GetApplicationAutoLaunch(kAppKey);
     Log("Registered with SteamVR (%s), start with SteamVR: %s\n", manifest.c_str(), g_autoStart ? "on" : "off");
 }
 
 // ================================================================ example pictures (--export-pictures <folder>)
-static bool SavePng(const std::wstring& path, const std::vector<uint32_t>& px, int W, int H) {
-    IWICImagingFactory* f = nullptr; IWICStream* s = nullptr; IWICBitmapEncoder* e = nullptr; IWICBitmapFrameEncode* fr = nullptr;
-    bool ok = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f)))
-           && SUCCEEDED(f->CreateStream(&s)) && SUCCEEDED(s->InitializeFromFilename(path.c_str(), GENERIC_WRITE))
-           && SUCCEEDED(f->CreateEncoder(GUID_ContainerFormatPng, nullptr, &e)) && SUCCEEDED(e->Initialize(s, WICBitmapEncoderNoCache))
-           && SUCCEEDED(e->CreateNewFrame(&fr, nullptr)) && SUCCEEDED(fr->Initialize(nullptr)) && SUCCEEDED(fr->SetSize(W, H));
-    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
-    ok = ok && SUCCEEDED(fr->SetPixelFormat(&fmt)) && fmt == GUID_WICPixelFormat32bppBGRA
-            && SUCCEEDED(fr->WritePixels(H, W * 4, W * H * 4, (BYTE*)px.data())) && SUCCEEDED(fr->Commit()) && SUCCEEDED(e->Commit());
-    if (fr) fr->Release(); if (e) e->Release(); if (s) s->Release(); if (f) f->Release();
-    return ok;
+static bool SavePng(const std::string& path, const std::vector<uint32_t>& px, int W, int H) {
+    std::vector<uint8_t> rgba((size_t)W * H * 4);
+    for (size_t i = 0; i < px.size(); ++i) {
+        uint32_t p = px[i];
+        rgba[i * 4 + 0] = (p >> 16) & 255; rgba[i * 4 + 1] = (p >> 8) & 255; rgba[i * 4 + 2] = p & 255; rgba[i * 4 + 3] = (p >> 24) & 255;
+    }
+    return stbi_write_png(path.c_str(), W, H, 4, rgba.data(), W * 4) != 0;
 }
 // The guide panel and the dashboard panel as they look in the headset, with an example window selected.
-static int ExportPictures(const std::wstring& dir) {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+static int ExportPictures(const std::string& dir) {
     g_exporting = true;
-    if (!g_guideGdi.Init(kGuideW, kGuideH) || !g_dashGdi.Init(kDashW, kDashH)) return 1;
+    if (!g_guidePanel.Init(kGuideW, kGuideH) || !g_dashPanel.Init(kDashW, kDashH)) { fprintf(stderr, "No font found\n"); return 1; }
     g_gameName = "Example game";
     g_cameraStatus = "none (headset or driver has no camera for SteamVR)";
     g_head = XMVectorSet(0, 1.6f, 0, 0);
@@ -2173,38 +2659,36 @@ static int ExportPictures(const std::wstring& dir) {
     g_presetHas[0] = true;
     int bad = 0;
     RenderGuide();
-    if (!SavePng(dir + L"/Guide.png", g_exportPx, kGuideW, kGuideH)) ++bad;
+    if (!SavePng(dir + "/Guide.png", g_exportPx, kGuideW, kGuideH)) ++bad;
     RenderDash();
-    if (!SavePng(dir + L"/Dashboard.png", g_exportPx, kDashW, kDashH)) ++bad;
-    CoUninitialize();
+    if (!SavePng(dir + "/Dashboard.png", g_exportPx, kDashW, kDashH)) ++bad;
     return bad;
 }
 
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmd, int) {
-    {   // --export-pictures <folder>: save the example pictures for the README, then quit
-        int argc = 0;
-        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-        if (argv && argc >= 3 && wcscmp(argv[1], L"--export-pictures") == 0) { int r = ExportPictures(argv[2]); LocalFree(argv); return r; }
-        if (argv) LocalFree(argv);
-    }
-    HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\AlphaViewsVR");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;   // already running
+static int Main(const std::vector<std::string>& args) {
+    // --export-pictures <folder>: save the example pictures for the README, then quit
+    if (args.size() >= 3 && args[1] == "--export-pictures") return ExportPictures(args[2]);
+    if (!SingleInstance()) return 0;   // already running
     InitDirAndLog();
-    Log("Alpha Views VR %s\n", AVVR_VERSION);
-    char exe[MAX_PATH]; GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    std::string exeDir = exe; exeDir = exeDir.substr(0, exeDir.find_last_of("\\/"));
+    Log("Alpha Views VR %s (%s)\n", AVVR_VERSION,
+#ifdef _WIN32
+        "Windows"
+#else
+        "Linux"
+#endif
+    );
+    std::string exeDir = ExeDir();
 
     vr::EVRInitError ie = vr::VRInitError_None;
     vr::VR_Init(&ie, vr::VRApplication_Overlay);
     if (ie != vr::VRInitError_None) {
         Log("Couldn't connect to SteamVR: %s\n", vr::VR_GetVRInitErrorAsEnglishDescription(ie));
-        MessageBoxW(nullptr, L"Alpha Views VR needs SteamVR. Start SteamVR first, then run it again.\n\n"
-                             L"(Once it has run, it starts with SteamVR by itself and lives in the SteamVR dashboard.)",
-                    L"Alpha Views VR", MB_OK | MB_ICONINFORMATION);
+        Message("Alpha Views VR needs SteamVR. Start SteamVR first, then run it again.\n\n"
+                "(Once it has run, it starts with SteamVR by itself and lives in the SteamVR dashboard.)");
         return 1;
     }
     Log("Connected to SteamVR\n");
-    if (!InitD3D()) { vr::VR_Shutdown(); return 1; }
+    if (!InitVulkan()) { Log("No Vulkan: can't draw anything\n"); vr::VR_Shutdown(); return 1; }
     RegisterApp(exeDir);
     LoadSettings();
     CheckCamera();
@@ -2222,7 +2706,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmd, int) {
         O()->SetOverlayMouseScale(g_dashOv, &unit);
         MakeDashThumb();
     }
-    if (!g_guideGdi.Init(kGuideW, kGuideH) || !g_dashGdi.Init(kDashW, kDashH)) Log("GDI setup failed\n");
+    if (!g_guidePanel.Init(kGuideW, kGuideH) || !g_dashPanel.Init(kDashW, kDashH)) Log("Panels: no font found, so no text\n");
     CheckGame();
 
     bool running = true;
@@ -2268,6 +2752,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmd, int) {
     StopCamera();
     vr::VR_Shutdown();
     Log("Closed\n");
-    if (single) CloseHandle(single);
     return 0;
 }
+
+#ifdef _WIN32
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    std::vector<std::string> args;
+    for (int i = 0; argv && i < argc; ++i) args.push_back(Utf8Of(argv[i]));
+    if (argv) LocalFree(argv);
+    return Main(args);
+}
+#else
+int main(int argc, char** argv) { return Main(std::vector<std::string>(argv, argv + argc)); }
+#endif

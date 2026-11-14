@@ -5,6 +5,7 @@
       "app_key": "gmo.alphaviewsvr",
       "launch_type": "binary",
       "binary_path_windows": "AlphaViewsVR.exe",
+      "binary_path_linux": "AlphaViewsVR",
       "is_dashboard_overlay": true,
       "strings": {
         "en_us": {

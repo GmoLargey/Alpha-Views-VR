@@ -33,22 +33,29 @@ Compress-Archive -Path $out -DestinationPath $zip
 # Source package.
 $src = "$dist\$name-source"
 if (Test-Path $src) { Remove-Item -Recurse -Force $src }
-New-Item -ItemType Directory -Force "$src\packaging" | Out-Null
+New-Item -ItemType Directory -Force "$src\packaging", "$src\linux" | Out-Null
 Copy-Item "$root\main.cpp", "$root\CMakeLists.txt", "$root\alphaviewsvr.vrmanifest" $src
-Copy-Item "$PSScriptRoot\README.txt", "$PSScriptRoot\LICENSE.txt", "$PSScriptRoot\THIRD_PARTY_NOTICES.txt", "$PSScriptRoot\package.ps1" "$src\packaging"
+Copy-Item "$root\linux\sal.h" "$src\linux"
+Copy-Item "$PSScriptRoot\README.txt", "$PSScriptRoot\LICENSE.txt", "$PSScriptRoot\THIRD_PARTY_NOTICES.txt", "$PSScriptRoot\package.ps1", "$PSScriptRoot\package.sh" "$src\packaging"
 Copy-Item "$PSScriptRoot\LICENSE.txt" "$src\LICENSE.txt"
 @"
 Alpha Views VR $version - source code
 https://github.com/GmoLargey/Alpha-Views-VR
 Copyright (C) 2026 GmoLargey. GNU GPL version 3 (GPL-3.0-only): see LICENSE.txt.
 
-Build (Windows, Visual Studio 2022 with C++ and CMake 3.20+):
+Build on Windows (Visual Studio 2022 with C++, CMake 3.20+):
   cmake -S . -B build -A x64
   cmake --build build --config Release
-The OpenVR SDK files (openvr.h, openvr_api.lib / .dll, v2.15.6) are downloaded
-from Valve's GitHub repository into build\openvr by CMake.
 
-Release package: powershell -ExecutionPolicy Bypass -File packaging\package.ps1
+Build on Linux (x86-64; g++ 9+ or clang, CMake 3.20+, curl/TLS for the downloads):
+  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+  cmake --build build -j
+
+CMake downloads the SDK files into build\: OpenVR (v2.15.6), Vulkan-Headers,
+stb_truetype / stb_image_write, and on Linux DirectXMath. The Vulkan loader is
+the one on your computer (it comes with the graphics driver).
+
+Release packages: packaging\package.ps1 (Windows), packaging/package.sh (Linux).
 "@ | Set-Content "$src\README.txt" -Encoding utf8
 $szip = "$dist\$name-source.zip"
 if (Test-Path $szip) { Remove-Item -Force $szip }

@@ -1,13 +1,18 @@
 THIRD-PARTY NOTICES - ALPHA VIEWS VR
 
-Alpha Views VR includes the following open-source software. It keeps the
+Alpha Views VR includes the following open-source software. Each keeps its
 licence below; Alpha Views VR's own code is under the GNU GPL version 3
-(LICENSE.txt), and the licence below is compatible with it. Alpha Views VR
-otherwise only uses the Windows SDK (Direct3D, DirectXMath, GDI, WIC), which
-needs no notice here.
+(LICENSE.txt), and these licences are compatible with it. The Vulkan loader
+and the fonts are not included: the ones on your computer are used.
+
+  1. OpenVR SDK             BSD 3-Clause
+  2. stb_truetype,          MIT (or public domain)
+     stb_image_write
+  3. Vulkan-Headers         MIT (or Apache 2.0)
+  4. DirectXMath            MIT
 
 =============================================================================
-1. OpenVR SDK (openvr_api.dll, openvr.h)
+1. OpenVR SDK (openvr_api.dll / libopenvr_api.so, openvr.h)
    https://github.com/ValveSoftware/openvr  (version 2.15.6)
    Licensed under the BSD 3-Clause licence. Used unmodified.
 =============================================================================
@@ -39,3 +44,81 @@ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
 ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+=============================================================================
+2. stb_truetype and stb_image_write (panel text, the example pictures)
+   https://github.com/nothings/stb
+   Public domain, or the MIT licence (used here under MIT). Used unmodified.
+=============================================================================
+
+Copyright (c) 2017 Sean Barrett
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+=============================================================================
+3. Vulkan-Headers (vulkan.h)
+   https://github.com/KhronosGroup/Vulkan-Headers  (vulkan-sdk-1.4.357.0)
+   Apache 2.0 or the MIT licence (used here under MIT). Used unmodified.
+=============================================================================
+
+Copyright 2015-2026 The Khronos Group Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+=============================================================================
+4. DirectXMath (the 3D maths; on Windows it comes with the Windows SDK)
+   https://github.com/microsoft/DirectXMath  (jun2026)
+   Licensed under the MIT licence. Used unmodified.
+=============================================================================
+
+Copyright (c) Microsoft Corporation.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

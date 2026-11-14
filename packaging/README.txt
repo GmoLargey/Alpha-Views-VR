@@ -25,7 +25,9 @@ Pictures in this folder:
 1. BEFORE YOU START
 =============================================================================
 You need:
-  - Windows 10/11 (64-bit) and SteamVR.
+  - Windows 10/11 (64-bit) or Linux (x86-64, e.g. SteamOS 3.6+, Ubuntu
+    24.04+, a recent Arch / Fedora), and SteamVR. A graphics driver with
+    Vulkan (all current ones have it).
   - One of these, for the windows to show your room:
       a) A streamer with colour-key passthrough, e.g. Virtual Desktop. Set its
          passthrough colour key to the same colour as Alpha Views VR (green by
@@ -45,6 +47,13 @@ of the game. OpenXR games that run through SteamVR work too.
      afterwards, or run it once more from the new place).
   2. Start SteamVR.
   3. Run AlphaViewsVR.exe once.
+
+On Linux (AlphaViewsVR-<version>-linux.tar.gz):
+  1. Unpack it somewhere permanent, e.g. ~/AlphaViewsVR:
+       tar xzf AlphaViewsVR-@VERSION@-linux.tar.gz
+  2. Start SteamVR.
+  3. Run ./AlphaViewsVR once (from a terminal, or double-click it). Keep
+     libopenvr_api.so and alphaviewsvr.vrmanifest next to it.
 
 That's it. It registers itself with SteamVR, turns on "start with SteamVR",
 and from then on it starts whenever SteamVR does. There is no window on the
@@ -76,7 +85,7 @@ Its status shows the game you are in, how many windows it has, and the camera.
 4. EDIT MODE
 =============================================================================
 Turn it on with "Edit windows" in the dashboard (then close the dashboard), or
-Ctrl+Alt+E on the keyboard.
+Ctrl+Alt+E on the keyboard (Windows).
 
 In edit mode SteamVR's laser pointer comes out of your controller, and the
 game gets no controller input until you finish. Point the laser and pull the
@@ -125,7 +134,7 @@ outline: tap the pencil, then hold the trigger anywhere you point and trace
 the shape; let go to finish (or end on the yellow start dot). The window takes
 the new shape where you drew it.
 
-KEYBOARD (Ctrl+Alt + key, works in or out of edit mode):
+KEYBOARD (Windows only; Ctrl+Alt + key, works in or out of edit mode):
 
   E        edit mode on / off
   N        new window
@@ -143,7 +152,7 @@ Every game has its own windows: Alpha Views VR sees which game is running and
 loads its windows (and saves them as you change them). Each game also has its
 own three presets.
 
-Files (%LOCALAPPDATA%\AlphaViewsVR):
+Files (Windows: %LOCALAPPDATA%\AlphaViewsVR; Linux: ~/.local/share/AlphaViewsVR):
   log.txt                          what happened (useful if something's wrong)
   settings.cfg                     colour and guide panel setting
   windows_<game>.cfg               each game's windows
@@ -174,14 +183,20 @@ Files (%LOCALAPPDATA%\AlphaViewsVR):
   1. In the Alpha Views dashboard panel, turn "Start with SteamVR" off (or in
      SteamVR Settings > Startup / Shutdown > Choose Startup Overlay Apps).
   2. Close SteamVR, then delete the Alpha Views VR folder.
-  3. Optional: delete %LOCALAPPDATA%\AlphaViewsVR (your windows and log).
+  3. Optional: delete %LOCALAPPDATA%\AlphaViewsVR (Linux:
+     ~/.local/share/AlphaViewsVR), your windows and log.
 
 
 =============================================================================
 8. TROUBLESHOOTING
 =============================================================================
-  - No Alpha Views icon in the dashboard: run AlphaViewsVR.exe once while
-    SteamVR is running. Check log.txt.
+  - No Alpha Views icon in the dashboard: run AlphaViewsVR.exe (Linux:
+    ./AlphaViewsVR) once while SteamVR is running. Check log.txt.
+  - Linux: "version `GLIBC_2.38' not found" means your system is older than
+    the one the program was built on: build it from the source (see the
+    source zip's README.txt; it takes a minute).
+  - Nothing shows at all: log.txt says if Vulkan couldn't start (update the
+    graphics driver).
   - The windows show the key colour but not your room: set your streamer's
     passthrough colour key to the same colour (Colour button / Ctrl+Alt+C).
   - "camera" isn't offered as a colour: SteamVR has no camera for your headset

@@ -43,10 +43,16 @@ The Alpha Views panel in the SteamVR dashboard:
 
 ## Install
 
-1. Download `AlphaViewsVR-<version>.zip` from [Releases](https://github.com/GmoLargey/Alpha-Views-VR/releases)
-   and unzip it somewhere permanent.
+Windows 10/11 (64-bit) or Linux (x86-64), with SteamVR.
+
+1. Download `AlphaViewsVR-<version>.zip` (Windows) or `AlphaViewsVR-<version>-linux.tar.gz` (Linux)
+   from [Releases](https://github.com/GmoLargey/Alpha-Views-VR/releases) and unpack it somewhere permanent.
 2. Start SteamVR.
-3. Run `AlphaViewsVR.exe` once. It registers with SteamVR and from then on starts with it.
+3. Run `AlphaViewsVR.exe` (Linux: `./AlphaViewsVR`) once. It registers with SteamVR and from then on
+   starts with it.
+
+The Linux build needs glibc 2.38 or newer (SteamOS 3.6+, Ubuntu 24.04+, current Arch / Fedora); on
+older systems, build it from source.
 
 Open the SteamVR dashboard and choose the Alpha Views icon in the bottom bar. Everything else is in
 the [user guide](packaging/README.txt).
@@ -62,7 +68,7 @@ the [user guide](packaging/README.txt).
 | Box faces button | cycle which faces show |
 | Pencil (free shapes) | arm, then trace anywhere you point |
 
-| Keyboard (Ctrl+Alt +) | |
+| Keyboard, Windows only (Ctrl+Alt +) | |
 |---|---|
 | E | edit mode on / off |
 | N | new window |
@@ -87,11 +93,22 @@ cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-CMake downloads the OpenVR SDK files (v2.15.6) from Valve's repository into `build/openvr`.
-`packaging/package.ps1` builds the release zips (app, user guide, licence, pictures, source).
+Linux (x86-64), g++ 9+ or clang, CMake 3.20 or newer:
+
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+The same code runs on both: every picture is drawn on the CPU and handed to SteamVR as a Vulkan
+image (the Vulkan loader is opened at run time), and the panel text is drawn with stb_truetype
+(Segoe UI on Windows, the desktop's sans-serif font on Linux). CMake downloads the OpenVR SDK
+(v2.15.6), Vulkan-Headers, stb_truetype / stb_image_write and, on Linux, DirectXMath into `build/`.
+`packaging/package.ps1` builds the Windows zip and the source zip; `packaging/package.sh` builds the
+Linux tarball.
 
 ## Licence
 
 Copyright (C) 2026 GmoLargey. Free software under the GNU General Public License, version 3
-(GPL-3.0-only): see [LICENSE](LICENSE). Uses Valve's OpenVR API (BSD-3-Clause): see
-[THIRD_PARTY_NOTICES.txt](packaging/THIRD_PARTY_NOTICES.txt).
+(GPL-3.0-only): see [LICENSE](LICENSE). Uses Valve's OpenVR API (BSD-3-Clause), stb (MIT),
+Vulkan-Headers (MIT) and DirectXMath (MIT): see [THIRD_PARTY_NOTICES.txt](packaging/THIRD_PARTY_NOTICES.txt).
