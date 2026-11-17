@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(AlphaViewsVR VERSION 1.1.1 LANGUAGES CXX)
+project(AlphaViewsVR VERSION 1.1.2 LANGUAGES CXX)
 
 # Windows (64-bit) and Linux (x86-64). Everything is drawn on the CPU and handed to SteamVR as Vulkan
 # images; only a thin platform layer in main.cpp differs. The SDK files below are downloaded once

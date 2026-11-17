@@ -202,6 +202,15 @@ Files (Windows: %LOCALAPPDATA%\AlphaViewsVR; Linux: ~/.local/share/AlphaViewsVR)
     passthrough colour key to the same colour (Colour button / Ctrl+Alt+C).
   - "camera" isn't offered as a colour: SteamVR has no camera for your headset
     (the dashboard panel's status says so).
+  - The camera picture looks warped, stretched or out of place: first check
+    SteamVR's own Room View. If it looks wrong there too, the headset driver's
+    camera calibration is off (e.g. some WMR headsets with Oasis). Otherwise,
+    send log.txt: it lists everything the driver says about its cameras. To
+    try other settings, make a file camera.cfg next to log.txt with:
+      frame=1     use SteamVR's cropped undistorted picture (before 1.1.2)
+      frame=2     use the full undistorted picture (the default)
+      pose=1      always use the headset pose from when the picture was taken
+    and restart Alpha Views VR.
   - The laser doesn't do anything: edit mode must be on, and the dashboard
     closed.
 

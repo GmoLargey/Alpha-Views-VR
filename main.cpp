@@ -24,7 +24,7 @@
 // Hotkeys (Ctrl+Alt + key): E edit mode, P windows on / off, N new window, X delete all windows,
 // C colour, G guide panel on / off, 1 2 3 load preset (+Shift: save).
 //
-// Files: %LOCALAPPDATA%\AlphaViewsVR\ (log.txt, settings.cfg, windows_<game>.cfg and presets).
+// Files: %LOCALAPPDATA%\AlphaViewsVR\ (log.txt, settings.cfg, camera.cfg (optional), windows_<game>.cfg and presets).
 
 #ifdef _WIN32
 #include <windows.h>
@@ -1023,6 +1023,7 @@ void Canvas::End() {
 // The latest camera frame (RGBA bytes), for camera mode.
 static std::vector<uint8_t> g_camPx;
 static uint32_t g_camW = 0, g_camH = 0, g_camBpp = 4;
+static bool g_camAlphaMask = false;   // the frame type marks invalid pixels with alpha 0
 static uint32_t CameraColour(const CB& cb, float lx, float ly) {
     const auto& m = cb.toCam.m;
     float cx = lx * m[0][0] + ly * m[1][0] + m[3][0], cy = lx * m[0][1] + ly * m[1][1] + m[3][1], cw = lx * m[0][3] + ly * m[1][3] + m[3][3];
@@ -1034,6 +1035,11 @@ static uint32_t CameraColour(const CB& cb, float lx, float ly) {
     int x1 = std::min(x0 + 1, (int)g_camW - 1), y1 = std::min(y0 + 1, (int)g_camH - 1);
     float ax = std::clamp(fx - x0, 0.0f, 1.0f), ay = std::clamp(fy - y0, 0.0f, 1.0f);
     auto at = [](int x, int y, int k) { return (float)g_camPx[((size_t)y * g_camW + x) * g_camBpp + k]; };
+    // MaximumUndistorted frames mark pixels with no camera data by alpha 0: show those black.
+    if (g_camAlphaMask && g_camBpp == 4) {
+        int nx = std::clamp((int)lroundf(fx), 0, (int)g_camW - 1), ny = std::clamp((int)lroundf(fy), 0, (int)g_camH - 1);
+        if (at(nx, ny, 3) == 0) return 0xFF000000u;
+    }
     float c[3];
     for (int k = 0; k < 3; ++k) {
         float top = at(x0, y0, k) + (at(x1, y0, k) - at(x0, y0, k)) * ax, bot = at(x0, y1, k) + (at(x1, y1, k) - at(x0, y1, k)) * ax;
@@ -1110,6 +1116,97 @@ static XMFLOAT4X4 g_camWorldToClip;   // world -> camera clip (row vectors), for
 static XMFLOAT4 g_camRect{ 0, 0, 1, 1 };
 static uint32_t g_camSeq = 0;
 static bool g_camFrameOk = false;
+// Frame type. MaximumUndistorted is what openxr-steamvr-passthrough's 2D Room View mode uses, the
+// mode reported working with Oasis (WMR); Undistorted is an inscribed crop whose size "is subject to
+// change", and drivers other than lighthouse don't always give it a matching projection.
+// camera.cfg (optional, in the settings folder) overrides, for testing on new headsets:
+//   frame=0|1|2   0 Distorted (not undistorted here: diagnostics only), 1 Undistorted, 2 MaximumUndistorted
+//   pose=0|1      0 header pose (falls back to the pose at exposure time), 1 always the pose at exposure time
+static vr::EVRTrackedCameraFrameType g_camFrameType = vr::VRTrackedCameraFrameType_MaximumUndistorted;
+static int g_camPoseMode = 0;
+// How long ago a frame's exposure was (host system ticks: the performance counter on Windows,
+// assumed CLOCK_MONOTONIC nanoseconds on Linux). 0 when the value doesn't look sane.
+static float SecondsSinceTicks(uint64_t t) {
+    if (!t) return 0;
+#ifdef _WIN32
+    LARGE_INTEGER now, f;
+    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&f);
+    double s = ((double)now.QuadPart - (double)t) / (double)f.QuadPart;
+#else
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double s = ((double)ts.tv_sec * 1e9 + ts.tv_nsec - (double)t) / 1e9;
+#endif
+    return s >= 0 && s <= 0.2 ? (float)s : 0.0f;
+}
+static void LoadCameraConfig() {
+    if (FILE* f = OpenFile(g_dir + "/camera.cfg", "r")) {
+        char line[128];
+        while (fgets(line, sizeof line, f)) {
+            int v = 0;
+            if (sscanf(line, " frame = %d", &v) == 1 && v >= 0 && v <= 2) g_camFrameType = (vr::EVRTrackedCameraFrameType)v;
+            else if (sscanf(line, " pose = %d", &v) == 1) g_camPoseMode = v ? 1 : 0;
+        }
+        fclose(f);
+        Log("camera.cfg: frame type %d, pose mode %d\n", (int)g_camFrameType, g_camPoseMode);
+    }
+}
+static const char* kFrameTypeName[3] = { "Distorted", "Undistorted", "MaximumUndistorted" };
+// Everything the driver says about its cameras, once per start: what's needed to tell a driver's
+// calibration problem (warped lines, wrong scale) from ours (wrong half, wrong pose, offset).
+static void LogCameraInfo() {
+    auto* tc = vr::VRTrackedCamera();
+    auto* sys = vr::VRSystem();
+    const auto hmd = vr::k_unTrackedDeviceIndex_Hmd;
+    char model[128] = "", maker[128] = "", drv[128] = "";
+    sys->GetStringTrackedDeviceProperty(hmd, vr::Prop_ModelNumber_String, model, sizeof model);
+    sys->GetStringTrackedDeviceProperty(hmd, vr::Prop_ManufacturerName_String, maker, sizeof maker);
+    sys->GetStringTrackedDeviceProperty(hmd, vr::Prop_TrackingSystemName_String, drv, sizeof drv);
+    int32_t layout = sys->GetInt32TrackedDeviceProperty(hmd, vr::Prop_CameraFrameLayout_Int32);
+    int32_t nCams = sys->GetInt32TrackedDeviceProperty(hmd, vr::Prop_NumCameras_Int32);
+    Log("Camera info: %s %s (driver %s), %d camera(s), layout 0x%x (%s%s)\n", maker, model, drv, nCams, layout,
+        layout & vr::EVRTrackedCameraFrameLayout_Stereo ? "stereo" : "mono",
+        layout & vr::EVRTrackedCameraFrameLayout_Stereo ? (layout & vr::EVRTrackedCameraFrameLayout_VerticalLayout ? ", vertical" : ", horizontal") : "");
+    int nc = std::clamp(nCams, 1, 4);
+    for (int t = 0; t < 3; ++t) {
+        auto ft = (vr::EVRTrackedCameraFrameType)t;
+        uint32_t w = 0, h = 0, b = 0;
+        vr::EVRTrackedCameraError e = tc->GetCameraFrameSize(hmd, ft, &w, &h, &b);
+        Log("  %s: %ux%u, %u bytes (%s)\n", kFrameTypeName[t], w, h, b, tc->GetCameraErrorNameFromEnum(e));
+        for (int c = 0; c < nc; ++c) {
+            vr::HmdVector2_t fl{}, ce{};
+            e = tc->GetCameraIntrinsics(hmd, c, ft, &fl, &ce);
+            Log("    camera %d intrinsics: focal %.2f %.2f, centre %.2f %.2f (%s)\n", c, fl.v[0], fl.v[1], ce.v[0], ce.v[1], tc->GetCameraErrorNameFromEnum(e));
+            vr::HmdMatrix44_t p{};
+            e = tc->GetCameraProjection(hmd, c, ft, 0.05f, 100.0f, &p);
+            Log("    camera %d projection: [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f] (%s)\n", c,
+                p.m[0][0], p.m[0][1], p.m[0][2], p.m[0][3], p.m[1][0], p.m[1][1], p.m[1][2], p.m[1][3],
+                p.m[2][0], p.m[2][1], p.m[2][2], p.m[2][3], p.m[3][0], p.m[3][1], p.m[3][2], p.m[3][3], tc->GetCameraErrorNameFromEnum(e));
+            if (p.m[0][0] != 0 && p.m[1][1] != 0)
+                Log("    camera %d field of view from projection: %.1f x %.1f degrees\n", c,
+                    2 * atanf(1 / p.m[0][0]) * 57.29578f, 2 * atanf(1 / p.m[1][1]) * 57.29578f);
+        }
+    }
+    vr::ETrackedPropertyError pe = vr::TrackedProp_Success;
+    int32_t df[4]{};
+    uint32_t got = sys->GetArrayTrackedDeviceProperty(hmd, vr::Prop_CameraDistortionFunction_Int32_Array, vr::k_unInt32PropertyTag, df, sizeof df, &pe);
+    double dc[4][vr::k_unMaxDistortionFunctionParameters]{};
+    uint32_t gotC = sys->GetArrayTrackedDeviceProperty(hmd, vr::Prop_CameraDistortionCoefficients_Float_Array, vr::k_unFloatPropertyTag, dc, sizeof dc, &pe);
+    for (int c = 0; c < nc; ++c) {
+        if (got < (c + 1) * sizeof(int32_t)) break;
+        std::string s;
+        for (uint32_t k = 0; k < vr::k_unMaxDistortionFunctionParameters && gotC >= (c + 1) * sizeof dc[0]; ++k) { char b[24]; snprintf(b, sizeof b, " %.6g", dc[c][k]); s += b; }
+        Log("  camera %d distortion function %d (0 none, 1 f-theta, 2 extended f-theta), coefficients:%s\n", c, df[c], s.empty() ? " (none)" : s.c_str());
+    }
+    HmdMatrix34_t m[4]{};
+    got = sys->GetArrayTrackedDeviceProperty(hmd, vr::Prop_CameraToHeadTransforms_Matrix34_Array, vr::k_unHmdMatrix34PropertyTag, m, sizeof m, &pe);
+    if (got < sizeof m[0]) { m[0] = sys->GetMatrix34TrackedDeviceProperty(hmd, vr::Prop_CameraToHeadTransform_Matrix34); got = sizeof m[0]; Log("  (no transform array: using the single camera-to-head transform)\n"); }
+    for (uint32_t c = 0; c < got / sizeof m[0]; ++c) {
+        const auto& a = m[c].m;
+        Log("  camera %u to head: [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f]\n", c,
+            a[0][0], a[0][1], a[0][2], a[0][3], a[1][0], a[1][1], a[1][2], a[1][3], a[2][0], a[2][1], a[2][2], a[2][3]);
+    }
+}
 
 static void CheckCamera() {
     bool has = false;
@@ -1132,6 +1229,8 @@ static void StartCamera() {
     g_cameraStatus = "starting";
     int32_t layout = vr::VRSystem()->GetInt32TrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_CameraFrameLayout_Int32);
     Log("Camera streaming started (frame layout 0x%x)\n", layout);
+    static bool logged = false;
+    if (!logged) { LoadCameraConfig(); LogCameraInfo(); logged = true; }
 }
 static void StopCamera() {
     if (g_cam == INVALID_TRACKED_CAMERA_HANDLE) return;
@@ -1145,9 +1244,15 @@ static void StopCamera() {
 static bool UpdateCamera() {
     if (g_cam == INVALID_TRACKED_CAMERA_HANDLE) return false;
     auto* tc = vr::VRTrackedCamera();
-    const vr::EVRTrackedCameraFrameType kType = vr::VRTrackedCameraFrameType_Undistorted;
     uint32_t fw = 0, fh = 0, fbytes = 0;
-    vr::EVRTrackedCameraError e = tc->GetCameraFrameSize(vr::k_unTrackedDeviceIndex_Hmd, kType, &fw, &fh, &fbytes);
+    vr::EVRTrackedCameraError e = tc->GetCameraFrameSize(vr::k_unTrackedDeviceIndex_Hmd, g_camFrameType, &fw, &fh, &fbytes);
+    if (g_camFrameType == vr::VRTrackedCameraFrameType_MaximumUndistorted && (e != vr::VRTrackedCameraError_None || !fw || !fh)) {
+        Log("Camera: no %s frames (%s), using Undistorted\n", kFrameTypeName[2], tc->GetCameraErrorNameFromEnum(e));
+        g_camFrameType = vr::VRTrackedCameraFrameType_Undistorted;
+        e = tc->GetCameraFrameSize(vr::k_unTrackedDeviceIndex_Hmd, g_camFrameType, &fw, &fh, &fbytes);
+    }
+    const vr::EVRTrackedCameraFrameType kType = g_camFrameType;
+    g_camAlphaMask = kType == vr::VRTrackedCameraFrameType_MaximumUndistorted;
     vr::CameraVideoStreamFrameHeader_t hdr{};
     static std::vector<uint8_t> frame;
     if (e == vr::VRTrackedCameraError_None && fw && fh && fbytes >= fw * fh * 3) {
@@ -1178,14 +1283,30 @@ static bool UpdateCamera() {
                                                                  vr::k_unHmdMatrix34PropertyTag, camToHead, sizeof camToHead, &pe);
     XMMATRIX c2h = got >= sizeof(HmdMatrix34_t) ? FromHmd(camToHead[0])
                  : FromHmd(vr::VRSystem()->GetMatrix34TrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_CameraToHeadTransform_Matrix34));
-    XMMATRIX head = hdr.trackedDevicePose.bPoseIsValid ? FromHmd(hdr.trackedDevicePose.mDeviceToAbsoluteTracking) : g_headM;
+    // Headset pose when the picture was taken: the frame header's, else predicted back to the
+    // exposure (drivers other than lighthouse may leave the header pose empty).
+    bool hdrPose = g_camPoseMode == 0 && hdr.trackedDevicePose.bPoseIsValid;
+    XMMATRIX head = g_headM;
+    if (hdrPose) head = FromHmd(hdr.trackedDevicePose.mDeviceToAbsoluteTracking);
+    else {
+        vr::TrackedDevicePose_t past{};
+        float ago = SecondsSinceTicks(hdr.ulFrameExposureTime);
+        vr::VRSystem()->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, -ago, &past, 1);
+        if (past.bPoseIsValid) head = FromHmd(past.mDeviceToAbsoluteTracking);
+    }
+    static int lastPoseSrc = -1;
+    if ((int)hdrPose != lastPoseSrc) {
+        Log("Camera pose: %s (header pose %s, frame %.0f ms old)\n", hdrPose ? "frame header" : "pose at exposure time",
+            hdr.trackedDevicePose.bPoseIsValid ? "valid" : "missing", SecondsSinceTicks(hdr.ulFrameExposureTime) * 1000);
+        lastPoseSrc = (int)hdrPose;
+    }
     vr::HmdMatrix44_t pr{};
     tc->GetCameraProjection(vr::k_unTrackedDeviceIndex_Hmd, 0, kType, 0.05f, 100.0f, &pr);
     XMFLOAT4X4 prt;   // OpenVR's column-vector projection -> row vectors
     for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) prt.m[j][i] = pr.m[i][j];
     XMMATRIX worldToCam = XMMatrixInverse(nullptr, c2h * head);
     XMStoreFloat4x4(&g_camWorldToClip, worldToCam * XMLoadFloat4x4(&prt));
-    if (!g_camFrameOk) Log("Camera pictures arriving: %ux%u (%u bytes a pixel), camera 0 in u 0..%.2f v 0..%.2f (layout 0x%x)\n", fw, fh, g_camBpp, du, dv, layout);
+    if (!g_camFrameOk) Log("Camera pictures arriving: %s %ux%u (%u bytes a pixel), camera 0 in u 0..%.2f v 0..%.2f (layout 0x%x)\n", kFrameTypeName[kType], fw, fh, g_camBpp, du, dv, layout);
     g_camFrameOk = true;
     g_cameraStatus = "showing";
     return true;
