@@ -23,6 +23,8 @@ starts with SteamVR.
   far wall and floor; or everything but the front and floor.
 - **Key colour or camera:** green, blue or pink for colour-key streamers, or the headset's own
   camera where SteamVR has one (used automatically until you pick a colour).
+- **See-through (camera):** a slider on each window sets how much of the camera picture shows
+  over the game, from only the room down to only the game.
 - **Edit in the headset:** SteamVR's laser pointer moves, resizes and shapes the windows, with the
   same handles as Alpha Views XR (move, resize, round corners, lock, snap upright / level, free
   shape points, draw). The game gets no controller input while you edit.
@@ -66,6 +68,7 @@ the [user guide](packaging/README.txt).
 | Handles on the selected window | grab and drag |
 | Green box handle | tap: box / flat; hold + thumbstick: depth |
 | Box faces button | cycle which faces show |
+| Half-filled ring (camera mode) | slide: how much room shows |
 | Pencil (free shapes) | arm, then trace anywhere you point |
 
 | Keyboard, Windows only (Ctrl+Alt +) | |

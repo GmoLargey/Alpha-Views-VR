@@ -226,6 +226,8 @@ struct Window {
     bool ellipse = false;
     bool lock = false;
     int boxMode = 0;              // which faces of a box show: 0 all, 1 top + far wall, 2 far wall + floor, 3 all but front and floor
+    float see = 1;                // how much of the room shows through it: 1 all (the default), 0 none (camera mode only;
+                                  // Alpha Views XR: alpha passthrough). Saved after boxMode.
 };
 static bool IsShape(const Window& w) { return w.pts.size() >= 3; }
 static XMMATRIX WinMatrix(const Window& w) {
@@ -410,9 +412,9 @@ static void MakeRect(Window& w) {
 
 // ================================================================ state
 enum GrabMode { GRAB_NONE, GRAB_MOVE, GRAB_CORNER, GRAB_RADIUS, GRAB_POINT, GRAB_ADDPT, GRAB_TYPE, GRAB_DRAWBTN,
-                GRAB_TRACE, GRAB_CIRCLEBTN, GRAB_LOCKBTN, GRAB_SNAPBTN, GRAB_GUIDE, GRAB_ALL, GRAB_PRESET, GRAB_BUTTON, GRAB_DEPTH, GRAB_BOXMODE };
+                GRAB_TRACE, GRAB_CIRCLEBTN, GRAB_LOCKBTN, GRAB_SNAPBTN, GRAB_GUIDE, GRAB_ALL, GRAB_PRESET, GRAB_BUTTON, GRAB_DEPTH, GRAB_BOXMODE, GRAB_SEE };
 enum IconId { ICON_DOT, ICON_MOVE, ICON_RESIZE, ICON_ROUND, ICON_DEPTH, ICON_KEEP, ICON_TO_SHAPE, ICON_TO_RECT,
-              ICON_DRAW, ICON_POINT, ICON_ADD, ICON_TO_CIRCLE, ICON_LOCK, ICON_UNLOCK, ICON_SNAP };
+              ICON_DRAW, ICON_POINT, ICON_ADD, ICON_TO_CIRCLE, ICON_LOCK, ICON_UNLOCK, ICON_SNAP, ICON_SEE };
 
 static std::vector<Window> g_windows;
 static int g_selected = -1, g_drawArmed = -1;
@@ -444,6 +446,21 @@ static XMVECTOR DepthHandle(const Window& w) { return WinToWorld(w, w.hw + kDept
 // The box mode button: just past the depth handle (where Alpha Views XR has its keep-box button).
 static XMVECTOR BoxModeButton(const Window& w) { return WinToWorld(w, w.hw + (kDepthOut + 0.042f) * SpreadSide(w), 0, 0); }
 static const char* kBoxModeName[4] = { "whole box", "top and far wall", "far wall and floor", "all but front and floor" };
+// "See" slider (how much room shows through the window): outside the left edge, opposite the depth
+// handle, as in Alpha Views XR. A row of dots from bottom (0: game only) to top (1: room only) and
+// a knob at the window's value. Any of them takes hold of the slider.
+static const float kSeeOut = 0.075f, kSeeLen = 0.12f, kSeeKnobR = 0.014f, kSeeDotR = 0.0045f;
+static const int kSeeDots = 7;
+static XMFLOAT2 SeeLocal(const Window& w, float t) {   // t: 0 bottom .. 1 top
+    float s = SpreadSide(w);
+    return { -(w.hw + kSeeOut * s), (t - 0.5f) * kSeeLen * s };
+}
+static float SeeFromLocalY(const Window& w, float y) {   // nearest 5 %
+    float t = std::clamp(y / (kSeeLen * SpreadSide(w)) + 0.5f, 0.0f, 1.0f);
+    return roundf(t * 20) / 20;
+}
+// Does see-through work in the current colour mode? (Key colours can't be partly see-through.)
+static bool SeeWorks() { return g_keyMode == 3; }
 static XMFLOAT2 TopButton(const Window& w, float x) { float s = SpreadTop(w); return { x * s, w.hh + 0.045f * s }; }
 static XMFLOAT2 MidLocal(const Window& w, int k) {
     const XMFLOAT2 &a = w.pts[k], &b = w.pts[(k + 1) % w.pts.size()];
@@ -461,6 +478,7 @@ static XMVECTOR TargetPoint(const Window& w, GrabMode mode, int k) {
     case GRAB_SNAPBTN: { XMFLOAT2 b = TopButton(w, 0.09f); return WinToWorld(w, b.x, b.y); }
     case GRAB_DEPTH: return DepthHandle(w);
     case GRAB_BOXMODE: return BoxModeButton(w);
+    case GRAB_SEE: { XMFLOAT2 s = SeeLocal(w, k < 0 ? w.see : (float)k / (kSeeDots - 1)); return WinToWorld(w, s.x, s.y); }
     default: break;
     }
     return WinToWorld(w, 0, 0);
@@ -521,7 +539,7 @@ static bool ReadWindows(const std::string& path, bool* enabled) {
             }
             if (ok && sscanf(c, "%d%n", &keep, &adv) == 1) {
                 w.keep = keep != 0; c += adv;
-                if (sscanf(c, "%d%n", &ell, &adv) == 1) { w.ellipse = ell != 0 && !IsShape(w); c += adv; if (sscanf(c, "%d%n", &lock, &adv) == 1) { w.lock = lock != 0; c += adv; int bm = 0; if (sscanf(c, "%d", &bm) == 1) w.boxMode = std::clamp(bm, 0, 3); } }
+                if (sscanf(c, "%d%n", &ell, &adv) == 1) { w.ellipse = ell != 0 && !IsShape(w); c += adv; if (sscanf(c, "%d%n", &lock, &adv) == 1) { w.lock = lock != 0; c += adv; int bm = 0; if (sscanf(c, "%d%n", &bm, &adv) == 1) { w.boxMode = std::clamp(bm, 0, 3); c += adv; float se = 1; if (sscanf(c, "%f", &se) == 1 && std::isfinite(se)) w.see = std::clamp(se, 0.0f, 1.0f); } } }
             }
             ws.push_back(w);
         }
@@ -539,7 +557,7 @@ static bool WriteWindows(const std::string& path) {
             w.rot.x, w.rot.y, w.rot.z, w.rot.w, w.hw, w.hh, w.radius[0], w.radius[1], w.radius[2], w.radius[3],
             0, 0, 0, 0, w.hd, IsShape(w) ? (int)w.pts.size() : 0);
         if (IsShape(w)) for (auto& p : w.pts) fprintf(f, " %f %f", p.x, p.y);
-        fprintf(f, " %d %d %d %d\n", w.keep ? 1 : 0, w.ellipse ? 1 : 0, w.lock ? 1 : 0, w.boxMode);
+        fprintf(f, " %d %d %d %d %.2f\n", w.keep ? 1 : 0, w.ellipse ? 1 : 0, w.lock ? 1 : 0, w.boxMode, w.see);
     }
     fclose(f);
     return true;
@@ -736,6 +754,10 @@ static float Glyph(int id, P p) {
         float d = min(Seg(p, { -0.5f, -0.4f }, { 0.5f, -0.4f }), Seg(p, { 0, -0.4f }, { 0, 0.52f }));
         d = min(d, min(Seg(p, { 0.2f, -0.4f }, { 0.2f, -0.2f }), Seg(p, { 0.2f, -0.2f }, { 0, -0.2f })));
         return d - 0.07f;
+    }
+    if (id == ICON_SEE) {   // a ring, its left half filled: part game, part room
+        float r = Len(p);
+        return min(fabsf(r - 0.42f) - 0.07f, max(r - 0.42f, p.x));
     }
     return 1e3f;
 }
@@ -1342,7 +1364,12 @@ static vr::VROverlayHandle_t MakeOverlay(const std::string& key, const std::stri
 
 // Window overlays: one each, with its own picture.
 struct WinOv { vr::VROverlayHandle_t ov = vr::k_ulOverlayHandleInvalid; Canvas cv; std::string look; bool shown = false, inter = false;
-              XMFLOAT4X4 frame{}; float halfW = 0.1f, halfH = 0.1f; };   // where the picture is (a box: the sheet facing you)
+              XMFLOAT4X4 frame{}; float halfW = 0.1f, halfH = 0.1f;   // where the picture is (a box: the sheet facing you)
+              float alpha = -1; };                                    // overlay opacity last set (the see slider)
+// Overlay opacity for a window's pictures: its see value in camera mode, else solid (a key colour
+// mixed with the game would no longer match the streamer's key).
+static float WindowAlpha(int wi) { return SeeWorks() && wi >= 0 && wi < (int)g_windows.size() ? g_windows[wi].see : 1.0f; }
+static void SetAlpha(vr::VROverlayHandle_t ov, float& cur, float a) { if (cur != a) { O()->SetOverlayAlpha(ov, a); cur = a; } }
 static std::vector<WinOv> g_winOv;
 // Handle overlays: a pool, given out each frame to the selected window's handles.
 struct HandleOv { vr::VROverlayHandle_t ov = vr::k_ulOverlayHandleInvalid; Tex* tex = nullptr; bool shown = false, inter = false, flip = false;
@@ -1637,7 +1664,7 @@ static void RenderGuide() {
     if (g_selected >= 0 && g_selected < (int)g_windows.size()) {
         const Window& w = g_windows[g_selected];
         sel = Fmt(L"Window %d of %d  ·  %.0f x %.0f cm  ·  %ls%ls  ·  %.1f m away", g_selected + 1, (int)g_windows.size(), w.hw * 200, w.hh * 200,
-                  IsShape(w) ? L"free shape" : w.ellipse ? L"circle" : L"rectangle", ((w.lock ? std::wstring(L", angle locked") : std::wstring()) + (w.hd > 0 ? Fmt(L", box %.0f cm deep (%ls)", w.hd * 200, Widen(kBoxModeName[w.boxMode]).c_str()) : std::wstring())).c_str(), Dist(g_head, V(w.pos)));
+                  IsShape(w) ? L"free shape" : w.ellipse ? L"circle" : L"rectangle", ((w.lock ? std::wstring(L", angle locked") : std::wstring()) + (w.hd > 0 ? Fmt(L", box %.0f cm deep (%ls)", w.hd * 200, Widen(kBoxModeName[w.boxMode]).c_str()) : std::wstring()) + (w.see < 1 ? Fmt(L", %.0f%% room", w.see * 100) : std::wstring())).c_str(), Dist(g_head, V(w.pos)));
     } else sel = g_windows.empty() ? L"No windows yet: New window (above) makes one" : Fmt(L"None selected (%d windows): point at one and pull the trigger", (int)g_windows.size());
     if (g_drawArmed >= 0) sel += L"\nDrawing: hold the trigger on the window and trace the outline, let go to finish";
     if (Now() < g_windowsFullUntil) sel += Fmt(L"\n%d windows is the most: delete one to make another", kMaxWindows);
@@ -1683,6 +1710,7 @@ static void RenderGuide() {
         L"While holding it, thumbstick up / down: push / pull",
         L"Handles on the selected window: grab and drag",
         L"Box handle (green): tap = box, hold + thumbstick = depth",
+        L"Camera: slider on the left = how much room shows",
     };
     int y = top + 54;
     for (auto* s : kLaser) { g.Text(s, g.fText, cText, { x1, y, x2 - 30, y + 40 }, TX_LEFT | TX_SINGLELINE | TX_END_ELLIPSIS); y += 44; }
@@ -1713,9 +1741,10 @@ static void RenderGuide() {
         { ICON_SNAP, { 0.55f, 0.8f, 1 }, { 0.08f, 0.09f, 0.11f }, true },
         { ICON_DEPTH, { 0.1f, 0.68f, 0.22f } },
         { ICON_KEEP, { 0.95f, 0.55f, 0.1f } },
+        { ICON_SEE, { 0.8f, 0.8f, 0.8f } },
     };
     static const wchar_t* words[] = { L"move", L"resize (tiny = delete)", L"round corner", L"free shape", L"circle", L"draw outline",
-                                      L"point (tap = remove)", L"add point", L"lock angle", L"snap upright / level", L"box depth (tap / thumbstick)", L"box faces (cycle)" };
+                                      L"point (tap = remove)", L"add point", L"lock angle", L"snap upright / level", L"box depth (tap / thumbstick)", L"box faces (cycle)", L"see-through (camera: slide)" };
     g.Text(L"HANDLES", g.fHead, cHead, { x1, y, xEnd, y + 44 }, TX_LEFT | TX_SINGLELINE);
     y += 54;
     std::vector<std::pair<int, int>> spots;
@@ -1927,6 +1956,11 @@ static void BeginWindowGrab(GrabMode mode, int wi, int k) {
     LaserOnWindow(w, hit);
     XMStoreFloat3(&g_grab.hit0, hit);
     if (mode == GRAB_MOVE) { g_selected = wi; return; }
+    if (mode == GRAB_SEE) {   // the slider follows the laser at once (pointing at a dot jumps there)
+        g_grab.dragging = true;
+        w.see = SeeFromLocalY(w, WorldToWin(w, hit).y);
+        return;
+    }
     if (mode == GRAB_TRACE) {
         g_tracePlane = w;
         if (g_ctlOk) {
@@ -2012,6 +2046,7 @@ static void UpdateGrab(double now) {
     }
     XMVECTOR hit;
     if (!LaserOnWindow(G.mode == GRAB_TRACE ? g_tracePlane : w, hit)) return;
+    if (G.mode == GRAB_SEE) { w.see = SeeFromLocalY(w, WorldToWin(w, hit).y); return; }
     XMVECTOR p = hit + V(G.offset);
     if (G.mode == GRAB_CORNER) {
         int k = G.k;
@@ -2075,6 +2110,7 @@ static void EndGrab(double now) {
             RecentreShape(w);
         }
         if (G.mode == GRAB_TRACE) FinishTrace(G.win);
+        if (G.mode == GRAB_SEE) Log("Window %d shows %.0f%% room\n", G.win, w.see * 100);
         if (G.mode == GRAB_DEPTH) {
             if (tap) w.hd = w.hd > 0 ? 0 : 0.1f;   // tap: a 20 cm box, or flat again
             Log("Window %d depth %.0f cm%s\n", G.win, w.hd * 200, w.hd > 0 ? "" : " (flat)");
@@ -2124,6 +2160,18 @@ static void BuildHandles(std::vector<UiIcon>& out) {
         bool h = hovered(GRAB_BOXMODE, -1); float s = h ? 1.15f : 0.9f;
         const float* c = kCol[w.boxMode];
         add(GRAB_BOXMODE, -1, kButtonR * (h ? 1.25f : 1), { ICON_KEEP, { std::min(1.0f, c[0] * s), std::min(1.0f, c[1] * s), std::min(1.0f, c[2] * s) } }, face, face);
+    }
+    if (SeeWorks()) {   // see-through slider: track dots (dim below the knob, lit above), then the knob
+        bool a = g_grab.win == wi && g_grab.mode == GRAB_SEE;
+        bool h = a;
+        for (int k = -1; k < kSeeDots; ++k) h = h || hovered(GRAB_SEE, k);
+        for (int k = 0; k < kSeeDots; ++k) {
+            float t = (float)k / (kSeeDots - 1), b = t <= w.see + 1e-3f ? 0.85f : 0.35f;
+            if (fabsf(t - w.see) * kSeeLen < kSeeKnobR * 1.3f) continue;   // under the knob
+            add(GRAB_SEE, k, kSeeDotR * (h ? 1.3f : 1), { ICON_DOT, { b, b, b } }, wr, wu);
+        }
+        IconLook look = a ? IconLook{ ICON_SEE, { 1, 0.9f, 0.2f } } : IconLook{ ICON_SEE, { h ? 0.95f : 0.8f, h ? 0.95f : 0.8f, h ? 0.95f : 0.8f } };
+        add(GRAB_SEE, -1, kSeeKnobR * (h ? 1.25f : 1), look, face, face);
     }
     if (IsShape(w)) {
         bool h = hovered(GRAB_DRAWBTN, -1), armed = g_drawArmed == wi;
@@ -2311,7 +2359,7 @@ static bool BoxView(const Window& w, const std::vector<XMFLOAT2>& per, const std
 // selected in edit mode (its handles must stay in front) and in camera mode (one picture per box).
 // The front face is the window's own overlay (moved out to the front); the back and the sides come from
 // this pool, shared by all boxes.
-struct FaceOv { vr::VROverlayHandle_t ov = vr::k_ulOverlayHandleInvalid; bool shown = false, inter = false; int mirror = -1; Tex* tex = nullptr; uint32_t texVer = 0; int win = -1; };
+struct FaceOv { vr::VROverlayHandle_t ov = vr::k_ulOverlayHandleInvalid; bool shown = false, inter = false; int mirror = -1; Tex* tex = nullptr; uint32_t texVer = 0; int win = -1; float alpha = -1; };
 static std::vector<FaceOv> g_faceOv;
 static bool g_facePoolFull = false;
 static Tex* g_solidTex[3] = {};
@@ -2401,6 +2449,7 @@ static void ShowFaces(const std::vector<Face>& faces) {
         bool inter = g_edit && !(fabsf(hl.z) < fw.hd + 0.05f && fabsf(hl.x) < fw.hw + 0.05f && fabsf(hl.y) < fw.hh + 0.05f);   // not from inside it
         if (g_grab.mode != GRAB_NONE) inter = f.inter;
         if (inter != f.inter) { SetInteractive(f.ov, inter); f.inter = inter; }
+        SetAlpha(f.ov, f.alpha, WindowAlpha(fc.win));
         if (!f.shown) { O()->ShowOverlay(f.ov); f.shown = true; }
     }
 }
@@ -2499,6 +2548,7 @@ static void ShowWindows(bool camNew) {
         bool inter = g_edit && !inside;
         if (g_grab.mode != GRAB_NONE && g_grab.win == (int)i) inter = o.inter;   // held: unchanged, or its let-go would be lost
         if (o.inter != inter) { SetInteractive(o.ov, inter); o.inter = inter; }
+        SetAlpha(o.ov, o.alpha, WindowAlpha((int)i));
         if (!o.shown) { O()->ShowOverlay(o.ov); o.shown = true; }
     }
     ShowFaces(faces);

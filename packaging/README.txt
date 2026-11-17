@@ -128,6 +128,11 @@ HANDLES on the selected window:
                          green    the whole box
                        The faces belong to the box: "front" is the window's
                        front, "top" the face along the window's top edge.
+    Half-filled ring   (camera mode only, left of the window) see-through:
+                       slide it along its dotted track. Top: only the room
+                       (the default); lower: more and more of the game shows
+                       through the camera picture. Key colours can't be partly
+                       see-through, so it isn't shown with green, blue or pink.
 
 FREE SHAPES: the orange dots are the outline's points (drag them; tap one to
 remove it), the small "+" between two points adds a point. To draw a new
